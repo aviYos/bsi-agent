@@ -10,28 +10,28 @@ Pre-culture BSI Agent Evaluation
 Requirements:
     pip install transformers accelerate peft bitsandbytes openai datasets pyyaml tqdm
 """
-
-import sys
-from pathlib import Path
-
-# Add src to path so we can import bsi_agent
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from bsi_agent.agent.prompts import SYSTEM_PROMPT, ANTIBIOGRAM_CONTEXT, TREATMENT_GUIDELINES_CONTEXT
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import re
+import threading
+import os
+import re
+import json
+import math
+import torch
+
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-
-import torch
+from typing import Any, Optional, List, Dict
+# from src.bsi_agent.agent.local_llm import LocalChatModel, OpenAIChatBackend
 from openai import OpenAI
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
-
 
 # ===========================
 # Data structures
@@ -86,13 +86,13 @@ class BSIAgent:
         print(f"[BSIAgent] Loading base model: {base_model} on device {self.device}...")
         print(f"[BSIAgent] Loading LoRA adapter from: {adapter_path}...")
 
-        # tokenizer loading ...
+        # חשוב: לטעון את ה-tokenizer מה-adapter כדי לקבל את ה-chat_template והטוקנים המעודכנים
         self.tokenizer = AutoTokenizer.from_pretrained(adapter_path or base_model, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
 
-        # Load base model
+        # טוענים מודל בסיס
         base = AutoModelForCausalLM.from_pretrained(
             base_model,
             torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
@@ -100,44 +100,42 @@ class BSIAgent:
             trust_remote_code=True,
         )
 
-        # Load LoRA
+        # מזריקים את ה-LoRA
         self.model = PeftModel.from_pretrained(
             base,
             adapter_path,
         )
 
-        # Construct full system prompt matching training data
-        if system_prompt is None:
-            system_parts = [SYSTEM_PROMPT]
-            # Match training: add antibiogram and guidelines
-            system_parts.append(ANTIBIOGRAM_CONTEXT)
-            system_parts.append(TREATMENT_GUIDELINES_CONTEXT)
-            self.system_prompt = "\n\n".join(system_parts)
-        else:
-            self.system_prompt = system_prompt
+        # System prompt: (אפשר להחליף בזה מהפרויקט שלך)
+        self.system_prompt = system_prompt or (
+            "You are an Infectious Diseases consultant acting as a pre-culture BSI diagnostic agent.\n"
+            "Base your reasoning ONLY on pre-culture clinical information (history, vitals, labs, "
+            "risk factors, and optionally Gram stain). You NEVER have access to final culture results.\n\n"
+            "For EACH response, you MUST follow this structure:\n"
+            "1) First, write 1 short paragraph (around 1 sentence) of clinical reasoning in plain text.\n"
+            "2) If you need more information from the clinician, add ONE line starting with:\n"
+            '   QUESTION: <a single, concrete clinical question ending with a question mark?>\n'
+            "   If you do NOT need more information, do NOT include any line starting with 'QUESTION:'.\n"
+            "3) At the VERY END of your response, you MUST output a single JSON object, on a new line, "
+            "prefixed exactly by:\n"
+            "   FINAL_PATHOGEN_ESTIMATE_JSON:\n"
+            "   followed immediately by a valid JSON object of the form:\n"
+            '   {\"pathogen_estimate\": [\n'
+            '       {\"organism\": \"Escherichia coli\", \"confidence\": 0.7},\n'
+            '       {\"organism\": \"Klebsiella pneumoniae\", \"confidence\": 0.2},\n'
+            '       {\"organism\": \"Other / Unknown\", \"confidence\": 0.1}\n'
+            "   ]}\n" 
+            "CRITICAL: Always complete the JSON. Never truncate it. The JSON must be valid and parseable, with confidences between 0 and 1, ideally summing to 1.0. Check twice that the json is valid.\n"
+        )
 
-        self.history: List[Dict[str, str]] = []
 
 
-    def reset(self):
-        """Clear chat history."""
-        self.history = []
+        self.lock = threading.Lock()
 
-    def add_environment_message(self, text: str):
-        """Add a message from the environment (clinician/patient) as 'user' side."""
-        # MATCH TRAINING: Prefix with [ENVIRONMENT]:
-        formatted_text = f"[ENVIRONMENT]: {text}"
-        self.history.append({"role": "user", "content": formatted_text})
-
-    def _build_messages(self) -> List[Dict[str, str]]:
-        """Build messages list for chat template."""
-        messages = [{"role": "system", "content": self.system_prompt}]
-        messages.extend(self.history)
-        return messages
-
-    def generate_response(self) -> AgentResponse:
+    def generate_response(self, history: List[Dict[str, str]]) -> AgentResponse:
         """
         Generate a single agent turn and parse it into structured fields.
+        Accepts chat history (list of dicts with role=user/assistant).
 
         Returns:
             AgentResponse with:
@@ -149,7 +147,8 @@ class BSIAgent:
                 - treatment_recommendation (if parsed)
                 - is_question
         """
-        messages = self._build_messages()
+        messages = [{"role": "system", "content": self.system_prompt}]
+        messages.extend(history)
 
         # נבצע chat_template ונוודא שתמיד נקבל input_ids ו־attention_mask
         templ = self.tokenizer.apply_chat_template(
@@ -170,23 +169,21 @@ class BSIAgent:
             else:
                 attention_mask = torch.ones_like(input_ids)
 
-        with torch.no_grad():
-            gen_ids = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=self.temperature,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
+        with self.lock:
+            with torch.no_grad():
+                gen_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=self.temperature,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
 
         # חיתוך החלק החדש שנוצר אחרי ההקשר
         input_len = input_ids.shape[1]
         generated_ids = gen_ids[0][input_len:]
         raw_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-        # מוסיפים להיסטוריה כ־assistant
-        self.history.append({"role": "assistant", "content": raw_text})
 
         # פרסינג לפורמט המובנה שלנו
         response = self._parse_agent_output(raw_text)
@@ -286,6 +283,169 @@ class BSIAgent:
         )
 
 
+# ===========================
+# LLM Chat Backends
+# ==========================
+# bsi_agent/agent/local_llm.py
+
+
+
+ChatMessage = Dict[str, str]  # {"role": "system"|"user"|"assistant", "content": str}
+
+
+# =========================================================
+# Abstract-ish chat backend interface (duck-typed)
+# =========================================================
+
+class ChatBackend:
+    """
+    Minimal interface that HumanEnvironment / other code expects:
+
+        text = backend.generate(messages, temperature, max_tokens)
+
+    `messages` is a list of dicts with "role" and "content".
+    """
+
+    def generate(
+        self,
+        messages: List[ChatMessage],
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+    ) -> str:
+        raise NotImplementedError
+
+
+# =========================================================
+# OpenAI backend (remote)
+# =========================================================
+
+@dataclass
+class OpenAIChatBackend(ChatBackend):
+    model: str
+    api_key: Optional[str] = None
+
+    def __post_init__(self):
+        self.client = OpenAI(api_key=self.api_key)
+
+    def generate(
+        self,
+        messages: List[ChatMessage],
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+    ) -> str:
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content.strip()
+
+
+# =========================================================
+# Local backend (HF model)
+# =========================================================
+
+@dataclass
+class LocalChatModel(ChatBackend):
+    """
+    Simple wrapper for a local HF causal LM used in chat-style mode.
+
+    Example:
+        backend = LocalChatModel("microsoft/Phi-3.5-mini-instruct")
+        text = backend.generate(messages)
+    """
+
+    model_name: str
+    device: Optional[str] = None
+    torch_dtype: Optional[torch.dtype] = None
+
+    def __post_init__(self):
+        self.device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # If None, AutoModel will pick an appropriate dtype
+        dtype = self.torch_dtype
+
+        # Load tokenizer & model
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=dtype,
+            device_map="auto" if self.device == "cuda" else None,
+            trust_remote_code=True,
+        )
+        self.model.eval()
+
+    def _build_inputs(self, messages: List[ChatMessage]):
+        """
+        Turn chat messages into input_ids / attention_mask.
+        Prefer chat_template if available.
+        """
+        # If tokenizer has a chat template defined (Phi-3.5, Llama3, etc.)
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            encoded = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            if isinstance(encoded, torch.Tensor):
+                input_ids = encoded.to(self.model.device)
+                attention_mask = torch.ones_like(input_ids)
+            else:
+                input_ids = encoded["input_ids"].to(self.model.device)
+                attention_mask = encoded.get(
+                    "attention_mask",
+                    torch.ones_like(input_ids),
+                ).to(self.model.device)
+        else:
+            # Fallback: very simple role-tagged prompt
+            text_parts = []
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                if role == "system":
+                    text_parts.append(f"[SYSTEM] {content}\n")
+                elif role == "assistant":
+                    text_parts.append(f"[ASSISTANT] {content}\n")
+                else:
+                    text_parts.append(f"[USER] {content}\n")
+            text_parts.append("[ASSISTANT] ")
+            prompt = "".join(text_parts)
+
+            encoded = self.tokenizer(prompt, return_tensors="pt")
+            input_ids = encoded["input_ids"].to(self.model.device)
+            attention_mask = encoded["attention_mask"].to(self.model.device)
+
+        return input_ids, attention_mask
+
+    def generate(
+        self,
+        messages: List[ChatMessage],
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+    ) -> str:
+        """
+        Main entrypoint used by HumanEnvironment._chat().
+        """
+        input_ids, attention_mask = self._build_inputs(messages)
+
+        with torch.no_grad():
+            gen_ids = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_tokens,
+                do_sample=True if temperature > 0 else False,
+                temperature=temperature,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # Cut off the prompt portion
+        new_tokens = gen_ids[0, input_ids.shape[1]:]
+        text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        return text.strip()
 
 # ===========================
 # HumanEnvironment (GPT-4o)
@@ -293,7 +453,11 @@ class BSIAgent:
 
 class HumanEnvironment:
     """
-    GPT-4o-based environment that simulates the bedside clinician/patient.
+    Environment that simulates the bedside clinician/patient.
+
+    Supports two backends:
+      - OpenAIChatBackend (remote API, e.g. gpt-4o)
+      - LocalChatModel (local HF model)
 
     Design goals:
     - Presents only pre-culture clinical information.
@@ -306,22 +470,47 @@ class HumanEnvironment:
         case: Dict[str, Any],
         model: str = "gpt-4o",
         api_key: Optional[str] = None,
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+        backend: str = "openai",  # "openai" or "local"
     ):
         self.case = case
         self.model = model
-        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        self.temperature = temperature
+        self.max_tokens = max_tokens
 
-        self._history: List[Dict[str, str]] = []  # for environment-internal chat with GPT
+        # Select backend
+        backend = backend.lower()
+        if backend == "openai":
+            # Remote API backend
+            self._backend = OpenAIChatBackend(model=model, api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        elif backend == "local":
+            # Local HF model backend. Adjust kwargs to match your LocalChatModel signature.
+            self._backend = LocalChatModel(model_name=model)
+        else:
+            raise ValueError(f"Unknown HumanEnvironment backend: {backend}")
+
+        self._history: List[Dict[str, str]] = []  # for environment-internal chat with GPT/local LLM
 
         # Precompute a concise clinical summary from the case
         self.case_context = self._build_case_context(case)
 
+        # Ground-truth organism token (for leak protection)
+        gt_org = (case.get("organism") or "").strip().lower()
+        self.organism_token = gt_org.split()[0] if gt_org else None  # e.g. "escherichia"
+
+        # STRICT system prompt: no specific organism names at all
         self.system_prompt = (
             "You are simulating the bedside clinician (or the patient) in a bloodstream infection (BSI) case.\n"
-            "You know the full clinical details, but you DO NOT reveal final culture results or the exact organism name.\n"
+            "You know the full clinical details, but you MUST NOT reveal final culture results or any exact organism name.\n"
             "You may describe symptoms, vital signs, lab values, comorbidities, prior antibiotics, and risk factors.\n"
             "You may mention that blood cultures were drawn and are pending, and you MAY mention Gram stain findings,\n"
-            "but you MUST NOT say what organism grew in the culture.\n"
+            "but you MUST NOT say what organism grew in the culture and you MUST NOT name any specific organism such as "
+            "\"Escherichia coli\", \"E. coli\", \"Klebsiella\", \"Pseudomonas\", etc.\n"
+            "If you need to refer to likely pathogens, speak only in generic classes such as "
+            "\"common Gram-negative urinary pathogens\", \"enteric Gram-negative bacilli\", or "
+            "\"Gram-positive cocci\", NEVER in specific species or genus names.\n"
             "Keep answers concise and clinically realistic."
         )
 
@@ -352,8 +541,8 @@ class HumanEnvironment:
             lab_strs = []
             for lab in labs[:10]:
                 name = lab.get("lab_name", "Unknown")
-                
-                # Skip explicit culture results in labs if they appear
+
+                # Skip explicit culture / organism results in labs if they appear
                 if "culture" in name.lower() or "organism" in name.lower():
                     continue
 
@@ -378,8 +567,8 @@ class HumanEnvironment:
         if meds:
             drug_names = list({m.get("drug", "Unknown").split()[0] for m in meds[:5]})
             parts.append("Antibiotics received: " + ", ".join(drug_names))
-            
-        # [Improvement]: Allow Gram stain (pre-culture) but not Organism (post-culture)
+
+        # Allow Gram stain (pre-culture) but not organism name
         gram_stain = case.get("gram_stain")
         if gram_stain:
             parts.append(f"Gram Stain: {gram_stain}")
@@ -389,6 +578,50 @@ class HumanEnvironment:
 
         return "\n".join(parts)
 
+    def _sanitize_reply(self, text: str) -> str:
+        """
+        Post-process the environment reply to remove any accidental mention
+        of the ground-truth organism (or its genus token).
+        """
+        if not text:
+            return text
+
+        sanitized = text
+
+        # Remove explicit mention of the ground-truth token (e.g. "Escherichia")
+        if self.organism_token:
+            pattern = re.compile(r"\b" + re.escape(self.organism_token) + r"\b", flags=re.IGNORECASE)
+            if pattern.search(sanitized):
+                sanitized = pattern.sub("a likely pathogen", sanitized)
+
+        # Extra safety: strip a few common explicit names if they appear
+        explicit_names = [
+            "escherichia coli",
+            "e. coli",
+            "klebsiella",
+            "pseudomonas",
+            "staphylococcus aureus",
+            "streptococcus pneumoniae",
+        ]
+        for name in explicit_names:
+            pattern = re.compile(re.escape(name), flags=re.IGNORECASE)
+            if pattern.search(sanitized):
+                sanitized = pattern.sub("a common pathogen", sanitized)
+
+        return sanitized
+
+    def _chat(self, messages: List[Dict[str, str]], temperature: float, max_tokens: int) -> str:
+        """
+        Unified chat interface using whichever backend was selected.
+        Expects self._backend to implement .generate(messages, temperature, max_tokens) -> str
+        """
+        text = self._backend.generate(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return text.strip()
+
     def get_initial_presentation(self) -> str:
         """
         Returns an initial natural-language presentation of the case,
@@ -396,7 +629,12 @@ class HumanEnvironment:
         """
         user_prompt = (
             "Using the following case summary, introduce the patient and the situation to an Infectious Diseases consultant "
-            "in 2–4 concise sentences. Do NOT mention any specific organism name or final culture results.\n\n"
+            "in 2–4 concise sentences.\n\n"
+            "CRITICAL CONSTRAINTS:\n"
+            "- Do NOT mention any specific organism names (no species or genus names such as 'Escherichia coli', 'Klebsiella', etc.).\n"
+            "- Do NOT mention final culture results.\n"
+            "- If you wish to talk about likely pathogens, use only generic classes, e.g. 'Gram-negative rods', "
+            "'common urinary Gram-negative pathogens', 'Gram-positive cocci', etc.\n\n"
             f"CASE SUMMARY:\n{self.case_context}"
         )
 
@@ -405,17 +643,15 @@ class HumanEnvironment:
             {"role": "user", "content": user_prompt},
         ]
 
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.5,
-            max_tokens=512,
-        )
-        text = resp.choices[0].message.content.strip()
+        text = self._chat(messages, temperature=0.5, max_tokens=512)
+        text = self._sanitize_reply(text)
+
         # Save to internal history
-        self._history = [{"role": "system", "content": self.system_prompt},
-                         {"role": "user", "content": user_prompt},
-                         {"role": "assistant", "content": text}]
+        self._history = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": text},
+        ]
         return text
 
     def process_query(self, agent_text: str) -> str:
@@ -438,23 +674,25 @@ class HumanEnvironment:
             "The consultant asked the following question based on the current case:\n"
             f"\"{question}\"\n\n"
             "Respond as the bedside clinician, providing any additional information that would be "
-            "available pre-culture. You may mention Gram stain if appropriate. "
-            "Do NOT reveal any specific organism name or final culture result."
+            "available pre-culture.\n\n"
+            "CRITICAL CONSTRAINTS:\n"
+            "- Do NOT reveal any specific organism name (no species or genus, such as 'Escherichia coli', "
+            "'E. coli', 'Klebsiella', 'Pseudomonas', etc.).\n"
+            "- Do NOT reveal what organism grew in the culture or any final culture result.\n"
+            "- You MAY mention Gram stain results (e.g., 'Gram-negative rods in blood') and generic pathogen classes "
+            "like 'enteric Gram-negative bacilli' or 'Gram-positive cocci'.\n"
+            "- If you refer to likely pathogens, keep them generic and class-level only.\n"
         )
 
         messages = self._history + [{"role": "user", "content": user_prompt}]
+        text = self._chat(messages, temperature=0.6, max_tokens=256)
+        text = self._sanitize_reply(text)
 
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.6,
-            max_tokens=256,
-        )
-        text = resp.choices[0].message.content.strip()
         # Update history
         self._history.append({"role": "user", "content": user_prompt})
         self._history.append({"role": "assistant", "content": text})
         return text
+
 
 
 
@@ -609,6 +847,7 @@ def run_agent_on_case(
     environment_api_key: Optional[str] = None,
     max_turns: int = 8,
     min_agent_turns: int = 3,   # אפשר לשנות
+    backend: str = "openai",
 ) -> Dict[str, Any]:
     """
     Run a complete pre-culture dialogue between the agent and the HumanEnvironment.
@@ -617,12 +856,33 @@ def run_agent_on_case(
     - Roles always alternate user/assistant/user/assistant/...
     - final_response הוא התגובה האחרונה של הסוכן.
     """
-    env = HumanEnvironment(case, model=environment_model, api_key=environment_api_key)
+    if backend == "openai":
+        env = HumanEnvironment(
+            case,
+            model=environment_model,
+            api_key=environment_api_key,
+            temperature=0.7,
+            max_tokens=512,
+        backend="openai",  # or omit to auto-detect
+    )
+    else:
+        env = HumanEnvironment(
+        case,
+        model="mistralai/Mistral-7B-Instruct-v0.2",  # or your local GGUF path etc.
+        temperature=0.7,
+        max_tokens=512,
+        backend="local",
+    )
 
-    agent.reset()
+
     initial = env.get_initial_presentation()
-    agent.add_environment_message(initial)
 
+    # Track chat history for the agent model (system prompt is added by agent)
+    model_input_history: List[Dict[str, str]] = [
+        {"role": "user", "content": initial}
+    ]
+
+    # Track full dialogue history for saving
     dialogue_history: List[Dict[str, str]] = [
         {"role": "environment", "content": initial}
     ]
@@ -633,8 +893,11 @@ def run_agent_on_case(
 
     for turn in range(max_turns):
         # כאן מובטח שההודעה האחרונה בהיסטוריה היא user
-        response = agent.generate_response()
+        response = agent.generate_response(model_input_history)
+        
         dialogue_history.append({"role": "agent", "content": response.raw_text})
+        model_input_history.append({"role": "assistant", "content": response.raw_text})
+        
         num_agent_turns += 1
 
         # תנאי עצירה "רך": אם הסוכן נותן final_diagnosis אחרי כמה סיבובים
@@ -674,7 +937,7 @@ def run_agent_on_case(
         # בשתי הסיטואציות – חייבים להוסיף את תגובת ה-environment להיסטוריה,
         # כדי שתמיד יהיה user לפני הקריאה הבאה ל-generate_response
         dialogue_history.append({"role": "environment", "content": env_reply})
-        agent.add_environment_message(env_reply)
+        model_input_history.append({"role": "user", "content": env_reply})
 
     # אם לא הוגדר final_response במפורש – נשתמש באחרון
     # If we have no explicit final_response, previous code already sets it.
@@ -717,6 +980,8 @@ def main():
     parser.add_argument("--max_cases", type=int, default=None, help="Max number of cases to evaluate")
     parser.add_argument("--save_dialogues", type=str, default="./outputs/eval_dialogues.jsonl", help="Optional path to save dialogues JSONL")
     parser.add_argument("--save_metrics", type=str, default="./outputs/eval_metrics.json", help="Optional path to save metrics JSON")
+    parser.add_argument("--num_workers", type=int, default=1, help="Number of parallel workers for evaluation")
+    parser.add_argument("--backend", type=str, default="openai", choices=["openai", "local"], help="Backend for HumanEnvironment")
     parser.add_argument(
         "--base_model",
         type=str,
@@ -755,7 +1020,8 @@ def main():
     results: List[CaseEvaluation] = []
     dialogues_out = []
 
-    for idx, case in enumerate(tqdm(test_cases, desc="Evaluating cases")):
+    def process_case(args_tuple):
+        idx, case = args_tuple
         case_id = case.get("case_id", f"case_{idx}")
         ground_truth = case.get("organism", "Unknown")
 
@@ -765,6 +1031,7 @@ def main():
             environment_model=args.environment_model,
             environment_api_key=args.environment_api_key,
             max_turns=args.max_turns,
+            backend=args.backend,
         )
 
         final_response: AgentResponse = run_result["final_response"]
@@ -776,10 +1043,10 @@ def main():
             agent_differential=final_response.differential,
             num_turns=num_turns,
         )
-        results.append(eval_case)
 
+        dialogue_output = None
         if args.save_dialogues:
-            dialogues_out.append({
+            dialogue_output = {
                 "case_id": case_id,
                 "ground_truth": ground_truth,
                 "dialogue": run_result["dialogue"],
@@ -790,7 +1057,20 @@ def main():
                         for d in final_response.differential
                     ],
                 },
-            })
+            }
+        return eval_case, dialogue_output
+
+    with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+        futures = list(tqdm(
+            executor.map(process_case, enumerate(test_cases)),
+            total=len(test_cases),
+            desc=f"Evaluating cases (workers={args.num_workers})"
+        ))
+
+    for r, d in futures:
+        results.append(r)
+        if d:
+            dialogues_out.append(d)
 
     # Aggregate and print metrics
     metrics = aggregate_results(results)
