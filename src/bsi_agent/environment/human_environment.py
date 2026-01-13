@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
 
-from openai import OpenAI
+import os
+import re
 
 from bsi_agent.agent.prompts import ENVIRONMENT_SYSTEM_PROMPT
+from bsi_agent.agent.local_llm import LocalChatModel, OpenAIChatBackend
 
 
 class HumanEnvironment:
-    """Simulate a human clinician presenting the case using an OpenAI model."""
+    """
+    Simulate a human clinician presenting the case.
+
+    Backend options:
+    - OpenAIChatBackend (API models like gpt-4o)
+    - LocalChatModel (HF models like mistralai/Mistral-7B-Instruct-v0.2)
+    """
 
     _LIST_FIELD_LIMITS = {
         "labs": 12,
@@ -39,12 +47,32 @@ class HumanEnvironment:
         api_key: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 512,
+        backend: Optional[str] = None,  # "openai", "local" or None (=auto)
     ) -> None:
         self.case = case
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.client = OpenAI(api_key=api_key)
+
+        # ---- Backend selection ----
+        # Explicit:
+        #   backend="openai" -> force OpenAI API
+        #   backend="local"  -> force local HF model
+        # Auto (backend=None):
+        #   if model starts with "gpt-" or "o1-" and api_key given -> OpenAI
+        #   else -> local
+        if backend == "openai" or (
+            backend is None
+            and api_key
+            and (model.startswith("gpt-") or model.startswith("o1-"))
+        ):
+            self.backend_type = "openai"
+            self.chat_backend = OpenAIChatBackend(model=model, api_key=api_key)
+        else:
+            self.backend_type = "local"
+            # For local, we ignore api_key and treat `model` as HF model_name_or_path
+            self.chat_backend = LocalChatModel(model_name_or_path=model)
+
         self._system_prompt = self._build_system_prompt(case)
         self._conversation_history: list[dict[str, str]] = []
 
@@ -54,11 +82,16 @@ class HumanEnvironment:
 
     def _build_system_prompt(self, case: dict) -> str:
         case_summary = json.dumps(self._compress_case(case), indent=2)
+
+        # Note: we still pass organism into the template so the ENVIRONMENT_SYSTEM_PROMPT
+        # can describe it as *hidden ground truth*, but the prompt itself must instruct
+        # the model NOT to reveal it.
         susceptibilities = (
             json.dumps(self._sanitize(case.get("susceptibilities", {})), indent=2)
             if case.get("susceptibilities")
             else "Pending"
         )
+
         return ENVIRONMENT_SYSTEM_PROMPT.format(
             case_summary=case_summary,
             organism=case.get("organism", "Unknown"),
@@ -109,7 +142,6 @@ class HumanEnvironment:
             "admit_time": case.get("admit_time"),
         }
 
-        # Provide a quick glance at notable labs/vitals/meds without overwhelming tokens.
         highlights["notable_labs"] = self._collect_unique_entries(
             case.get("labs", []), label_field="lab_name", value_field="valuenum", unit_field="valueuom"
         )
@@ -137,12 +169,16 @@ class HumanEnvironment:
             if not label or label in seen_labels:
                 continue
             seen_labels.add(label)
-            collected.append({
-                "name": label,
-                "value": self._sanitize(entry.get(value_field)),
-                "unit": self._sanitize(entry.get(unit_field)),
-                "time": self._sanitize(entry.get("charttime") or entry.get("storetime") or entry.get("starttime")),
-            })
+            collected.append(
+                {
+                    "name": label,
+                    "value": self._sanitize(entry.get(value_field)),
+                    "unit": self._sanitize(entry.get(unit_field)),
+                    "time": self._sanitize(
+                        entry.get("charttime") or entry.get("storetime") or entry.get("starttime")
+                    ),
+                }
+            )
             if len(collected) >= max_items:
                 break
         return collected
@@ -158,39 +194,58 @@ class HumanEnvironment:
             return {key: self._sanitize(val) for key, val in value.items()}
         return value
 
+    # ---------- NEW: small sanitizer for replies (avoid accidental leaks) ----------
+    def _sanitize_reply(self, text: str) -> str:
+        """
+        Optional hook: post-process environment reply to avoid obvious leaks.
+        For now it's identity; you can later strip exact label-set organism names here.
+        """
+        return text
+
+    # ---------- Public API ----------
+
     def get_initial_presentation(self) -> str:
         """Generate an initial presentation from the clinician."""
         self.reset()
+
         messages = [
             {"role": "system", "content": self._system_prompt},
             {
                 "role": "user",
                 "content": (
                     "Provide the initial consultation summary for this case. "
-                    "Include demographics, admission context, vital signs, and the most pertinent labs available at time zero."
+                    "Include demographics, admission context, vital signs, and the most pertinent labs available at time zero. "
+                    "Do NOT mention any exact organism names or final culture results."
                 ),
             },
         ]
-        response = self.client.chat.completions.create(
-            model=self.model,
+
+        content = self.chat_backend.chat(
             messages=messages,
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            max_new_tokens=self.max_tokens,
         )
-        content = response.choices[0].message.content.strip()
-        self._conversation_history.append({"role": "assistant", "content": content})
+        content = self._sanitize_reply(content)
+
+        # We only store the assistant reply; if you want full history, you can also store the user prompt.
+        self._conversation_history = [
+            {"role": "assistant", "content": content},
+        ]
         return content
 
     def process_query(self, query: str) -> str:
         """Respond to a consultant question using the simulated clinician."""
+        # Append the consultant question to the history as a 'user' turn
         self._conversation_history.append({"role": "user", "content": query})
+
         messages = [{"role": "system", "content": self._system_prompt}, *self._conversation_history]
-        response = self.client.chat.completions.create(
-            model=self.model,
+
+        content = self.chat_backend.chat(
             messages=messages,
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            max_new_tokens=self.max_tokens,
         )
-        content = response.choices[0].message.content.strip()
+        content = self._sanitize_reply(content)
+
         self._conversation_history.append({"role": "assistant", "content": content})
         return content

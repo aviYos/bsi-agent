@@ -11,6 +11,14 @@ Requirements:
     pip install transformers accelerate peft bitsandbytes openai datasets pyyaml tqdm
 """
 
+import sys
+from pathlib import Path
+
+# Add src to path so we can import bsi_agent
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from bsi_agent.agent.prompts import SYSTEM_PROMPT, ANTIBIOGRAM_CONTEXT, TREATMENT_GUIDELINES_CONTEXT
+
 import argparse
 import json
 import os
@@ -78,13 +86,13 @@ class BSIAgent:
         print(f"[BSIAgent] Loading base model: {base_model} on device {self.device}...")
         print(f"[BSIAgent] Loading LoRA adapter from: {adapter_path}...")
 
-        # חשוב: לטעון את ה-tokenizer מה-adapter כדי לקבל את ה-chat_template והטוקנים המעודכנים
+        # tokenizer loading ...
         self.tokenizer = AutoTokenizer.from_pretrained(adapter_path or base_model, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
 
-        # טוענים מודל בסיס
+        # Load base model
         base = AutoModelForCausalLM.from_pretrained(
             base_model,
             torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
@@ -92,35 +100,21 @@ class BSIAgent:
             trust_remote_code=True,
         )
 
-        # מזריקים את ה-LoRA
+        # Load LoRA
         self.model = PeftModel.from_pretrained(
             base,
             adapter_path,
         )
 
-        # System prompt: (אפשר להחליף בזה מהפרויקט שלך)
-        self.system_prompt = system_prompt or (
-            "You are an Infectious Diseases consultant acting as a pre-culture BSI diagnostic agent.\n"
-            "Base your reasoning ONLY on pre-culture clinical information (history, vitals, labs, "
-            "risk factors, and optionally Gram stain). You NEVER have access to final culture results.\n\n"
-            "For EACH response, you MUST follow this structure:\n"
-            "1) First, write 1 short paragraph (around 1 sentence) of clinical reasoning in plain text.\n"
-            "2) If you need more information from the clinician, add ONE line starting with:\n"
-            '   QUESTION: <a single, concrete clinical question ending with a question mark?>\n'
-            "   If you do NOT need more information, do NOT include any line starting with 'QUESTION:'.\n"
-            "3) At the VERY END of your response, you MUST output a single JSON object, on a new line, "
-            "prefixed exactly by:\n"
-            "   FINAL_PATHOGEN_ESTIMATE_JSON:\n"
-            "   followed immediately by a valid JSON object of the form:\n"
-            '   {\"pathogen_estimate\": [\n'
-            '       {\"organism\": \"Escherichia coli\", \"confidence\": 0.7},\n'
-            '       {\"organism\": \"Klebsiella pneumoniae\", \"confidence\": 0.2},\n'
-            '       {\"organism\": \"Other / Unknown\", \"confidence\": 0.1}\n'
-            "   ]}\n" 
-            "CRITICAL: Always complete the JSON. Never truncate it. The JSON must be valid and parseable, with confidences between 0 and 1, ideally summing to 1.0. Check twice that the json is valid.\n"
-        )
-
-
+        # Construct full system prompt matching training data
+        if system_prompt is None:
+            system_parts = [SYSTEM_PROMPT]
+            # Match training: add antibiogram and guidelines
+            system_parts.append(ANTIBIOGRAM_CONTEXT)
+            system_parts.append(TREATMENT_GUIDELINES_CONTEXT)
+            self.system_prompt = "\n\n".join(system_parts)
+        else:
+            self.system_prompt = system_prompt
 
         self.history: List[Dict[str, str]] = []
 
@@ -131,7 +125,9 @@ class BSIAgent:
 
     def add_environment_message(self, text: str):
         """Add a message from the environment (clinician/patient) as 'user' side."""
-        self.history.append({"role": "user", "content": text})
+        # MATCH TRAINING: Prefix with [ENVIRONMENT]:
+        formatted_text = f"[ENVIRONMENT]: {text}"
+        self.history.append({"role": "user", "content": formatted_text})
 
     def _build_messages(self) -> List[Dict[str, str]]:
         """Build messages list for chat template."""
