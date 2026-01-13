@@ -122,11 +122,20 @@ class BSIAgent:
     def _build_messages(self) -> list[dict]:
         """Build messages list for chat template."""
         messages = [{"role": "system", "content": self._get_system_content()}]
-
-        for turn in self.conversation_history:
-            role = "assistant" if turn["role"] == "agent" else "user"
-            messages.append({"role": role, "content": turn["content"]})
-
+        # Map internal roles to chat roles
+        role_map = {"agent": "assistant", "environment": "user"}
+        # Build a list of chat roles from conversation history
+        chat_turns = [
+            {"role": role_map.get(turn["role"], "user"), "content": turn["content"]}
+            for turn in self.conversation_history
+        ]
+        # Enforce strict alternation
+        expected_role = "user"
+        for turn in chat_turns:
+            if turn["role"] == expected_role:
+                messages.append(turn)
+                expected_role = "assistant" if expected_role == "user" else "user"
+            # If not expected role, skip until alternation is restored
         return messages
 
     def _get_system_content(self) -> str:

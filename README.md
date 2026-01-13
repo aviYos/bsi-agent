@@ -80,16 +80,35 @@ See `data/README.md` for detailed instructions.
 # Preprocess MIMIC-IV data
 python scripts/preprocess_mimic.py
 
+#Full:
+python scripts/preprocess_mimic.py --mimic_path /app/data/LLM_project_data/physionet.org/files/mimiciv/3.1 --output_dir data/processed --max_cases 1000 --val_ratio 0.0
+
 # Generate synthetic dialogues
-python scripts/generate_dialogues.py --num_dialogues 500
+python scripts/generate_dialogues.py --num_dialogues 500 
+#Full:
+python scripts/generate_dialogues.py --num_dialogues 5 --cases_path /app/code/LLM_project/bsi-agent/data/processed/train_cases.jsonl --api_key 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
+
 
 # Fine-tune the model
 python scripts/train.py --config configs/train_config.yaml
+#Full:
+python scripts/train.py --config configs/config.yaml
 
 # Run evaluation
 python scripts/evaluate.py --model_path outputs/model
-```
+#Full: 
+python scripts/evaluate.py --model_path outputs/model/checkpoint-5 --test_cases /app/code/LLM_project/bsi-agent/data/processed/test_cases.jsonl --save_chat 1 --adapter_path /app/code/LLM_project/bsi-agent/outputs/model/checkpoint-5 --environment_api_key  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
 
+python scripts/evaluate.py   --base_model mistralai/Mistral-7B-Instruct-v0.2   --adapter_path outputs/model/final   --test_cases /app/code/LLM_project/bsi-agent/data/processed/test_cases.jsonl   --max_turns 5   --environment_model gpt-4o   --save_dialogues outputs/eval_dialogues.jsonl   --environment_api_key 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
+
+
+python scripts/evaluate.py \
+  --agent_type gpt4o \
+  --test_cases /app/code/LLM_project/bsi-agent-ori/data/processed/test_cases.jsonl \
+  --agent_api_key "sk-YOUR_OPENAI_API_KEY" \
+  --environment_api_key "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" \
+  --save_dialogues outputs/gpt4o_eval_results.jsonl
+```
 ## Hardware Requirements
 
 - NVIDIA GPU with 48GB VRAM (e.g., L40) for training

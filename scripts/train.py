@@ -251,7 +251,7 @@ def main():
     dataset = prepare_dataset(dialogues, tokenizer, max_length=max_seq_length)
 
     # Split into train/val
-    split = dataset.train_test_split(test_size=0.1, seed=42)
+    split = dataset.train_test_split(test_size=0.0, seed=42)
     train_dataset = split["train"]
     val_dataset = split["test"]
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
