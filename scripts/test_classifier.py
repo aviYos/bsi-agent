@@ -19,6 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from bsi_agent.generation.pathogen_classifier import PathogenClassifier
+from bsi_agent.evaluation import pathogen_matches
 
 
 def load_summaries(path: Path) -> list[dict]:
@@ -100,13 +101,12 @@ def main():
     print("-" * 50)
     print(f"Saved {len(results)} results to {output_path}")
 
-    # Quick accuracy check
+    # Quick accuracy check (alias-aware top-3)
     top3_correct = 0
     for r in results:
         gt = r["ground_truth"].upper()
-        preds_upper = [p.upper() for p in r["predictions"]]
-        # Check if ground truth is in any of the predictions (partial match)
-        if any(gt in p or p in gt for p in preds_upper):
+        preds = r["predictions"]
+        if any(pathogen_matches(gt, p) for p in preds):
             top3_correct += 1
 
     print(f"\nQuick Top-3 Accuracy: {top3_correct}/{len(results)} = {100*top3_correct/len(results):.1f}%")

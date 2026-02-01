@@ -276,7 +276,8 @@ class BSICohortExtractor:
         self,
         max_cases: Optional[int] = None,
         hours_before_culture: int = 48,
-        hours_after_culture: int = 48,
+        hours_after_culture: int = 0,
+        include_derived_gram_stain: bool = False,
     ) -> list[BSICase]:
         """
         Extract complete BSI cases with all clinical context.
@@ -285,6 +286,8 @@ class BSICohortExtractor:
             max_cases: Maximum number of cases to extract (None for all)
             hours_before_culture: Hours of data to include before culture
             hours_after_culture: Hours of data to include after culture
+            include_derived_gram_stain: If True, infer Gram stain from organism name
+                (label-derived; disabled by default to prevent leakage)
 
         Returns:
             List of BSICase objects
@@ -452,7 +455,11 @@ class BSICohortExtractor:
                 culture_time=culture_time,
                 specimen_type=culture["spec_type_desc"],
                 organism=culture["org_name"],
-                gram_stain=self._get_morphology_hint(culture["org_name"]),
+                gram_stain=(
+                    self._get_morphology_hint(culture["org_name"])
+                    if include_derived_gram_stain
+                    else None
+                ),
                 susceptibilities=susceptibilities,
                 labs=patient_labs,
                 vitals=patient_vitals,

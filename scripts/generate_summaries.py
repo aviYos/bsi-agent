@@ -19,6 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from bsi_agent.generation.summary_generator import SummaryGenerator
+from bsi_agent.data.redaction import sanitize_summary
 
 
 def load_cases(path: Path) -> list[dict]:
@@ -96,6 +97,7 @@ def main():
     for case in tqdm(cases, desc="Generating summaries"):
         try:
             summary = generator.generate_summary(case)
+            summary = sanitize_summary(summary, case.get("organism", ""))
             summaries.append({
                 "case_id": case["case_id"],
                 "ground_truth_pathogen": case["organism"],

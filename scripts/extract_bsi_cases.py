@@ -47,8 +47,13 @@ def main():
     parser.add_argument(
         "--hours_after",
         type=int,
-        default=24,
+        default=0,
         help="Hours of data to include after culture",
+    )
+    parser.add_argument(
+        "--include_derived_gram_stain",
+        action="store_true",
+        help="Infer Gram stain from organism name (label-derived; not recommended)",
     )
     args = parser.parse_args()
 
@@ -68,6 +73,7 @@ def main():
         max_cases=args.max_cases,
         hours_before_culture=args.hours_before,
         hours_after_culture=args.hours_after,
+        include_derived_gram_stain=args.include_derived_gram_stain,
     )
 
     # Save cases

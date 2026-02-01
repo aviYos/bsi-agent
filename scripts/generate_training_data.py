@@ -24,6 +24,11 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from bsi_agent.data.utils import load_jsonl, save_jsonl, load_config
+from bsi_agent.data.redaction import (
+    sanitize_summary,
+    redact_pathogen_mentions,
+    find_pathogen_mentions,
+)
 from bsi_agent.generation import (
     QuestionGenerator,
     AnswerGenerator,
@@ -47,11 +52,18 @@ def step1_create_partial_summaries(input_path: Path, output_path: Path, seed: in
     results = []
 
     for i, item in enumerate(summaries):
-        partial, hidden = create_partial_summary(item["full_summary"], seed=seed + i)
+        safe_full = sanitize_summary(
+            item.get("full_summary", ""),
+            item.get("ground_truth_pathogen", ""),
+        )
+        partial, hidden = create_partial_summary(safe_full, seed=seed + i)
+        leaks = find_pathogen_mentions(partial, item.get("ground_truth_pathogen", ""))
+        if leaks:
+            print(f"Warning: possible pathogen leakage in {item.get('case_id')}: {leaks}")
         results.append({
             "case_id": item["case_id"],
             "ground_truth_pathogen": item["ground_truth_pathogen"],
-            "full_summary": item["full_summary"],
+            "full_summary": safe_full,
             "partial_summary": partial,
             "hidden_categories": list(hidden.keys()),
         })
@@ -86,11 +98,21 @@ def step2_generate_questions(input_path: Path, output_path: Path, api_key: str, 
     for item in tqdm(data, desc="Generating questions"):
         try:
             question = generator.generate(item["partial_summary"])
+            question = redact_pathogen_mentions(
+                question,
+                item.get("ground_truth_pathogen", ""),
+            )
             results.append({
                 "case_id": item["case_id"],
                 "ground_truth_pathogen": item["ground_truth_pathogen"],
-                "full_summary": item["full_summary"],
-                "partial_summary": item["partial_summary"],
+                "full_summary": sanitize_summary(
+                    item.get("full_summary", ""),
+                    item.get("ground_truth_pathogen", ""),
+                ),
+                "partial_summary": sanitize_summary(
+                    item.get("partial_summary", ""),
+                    item.get("ground_truth_pathogen", ""),
+                ),
                 "question": question,
             })
         except Exception as e:
@@ -114,7 +136,15 @@ def step3_generate_answers(input_path: Path, output_path: Path, api_key: str, mo
 
     for item in tqdm(data, desc="Generating answers"):
         try:
-            answer = generator.generate(item["full_summary"], item["question"])
+            safe_full = sanitize_summary(
+                item.get("full_summary", ""),
+                item.get("ground_truth_pathogen", ""),
+            )
+            answer = generator.generate(safe_full, item["question"])
+            answer = redact_pathogen_mentions(
+                answer,
+                item.get("ground_truth_pathogen", ""),
+            )
             results.append({
                 "case_id": item["case_id"],
                 "ground_truth_pathogen": item["ground_truth_pathogen"],
@@ -140,17 +170,29 @@ def step4_create_dialogues(input_path: Path, output_path: Path):
 
     results = []
     for item in data:
+        safe_question = redact_pathogen_mentions(
+            item.get("question", ""),
+            item.get("ground_truth_pathogen", ""),
+        )
+        safe_answer = redact_pathogen_mentions(
+            item.get("answer", ""),
+            item.get("ground_truth_pathogen", ""),
+        )
+        safe_partial = sanitize_summary(
+            item.get("partial_summary", ""),
+            item.get("ground_truth_pathogen", ""),
+        )
         dialogue = create_dialogue(
-            item["partial_summary"],
-            item["question"],
-            item["answer"]
+            safe_partial,
+            safe_question,
+            safe_answer,
         )
         results.append({
             "case_id": item["case_id"],
             "ground_truth_pathogen": item["ground_truth_pathogen"],
-            "x": item["partial_summary"],
-            "q": item["question"],
-            "answer": item["answer"],
+            "x": safe_partial,
+            "q": safe_question,
+            "answer": safe_answer,
             "d": dialogue,
         })
 
