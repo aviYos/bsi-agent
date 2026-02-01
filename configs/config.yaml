@@ -40,6 +40,7 @@ dialogue_generation:
   num_dialogues: 500
   max_turns: 10
   temperature: 0.7
+  api_key: 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
 
 # Environment configuration
 environment:
