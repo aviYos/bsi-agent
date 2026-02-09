@@ -101,15 +101,19 @@ def main():
     print("-" * 50)
     print(f"Saved {len(results)} results to {output_path}")
 
-    # Quick accuracy check (alias-aware top-3)
+    # Quick accuracy check (alias-aware top-1 and top-3)
+    top1_correct = 0
     top3_correct = 0
     for r in results:
         gt = r["ground_truth"].upper()
         preds = r["predictions"]
+        if preds and pathogen_matches(gt, preds[0]):
+            top1_correct += 1
         if any(pathogen_matches(gt, p) for p in preds):
             top3_correct += 1
 
-    print(f"\nQuick Top-3 Accuracy: {top3_correct}/{len(results)} = {100*top3_correct/len(results):.1f}%")
+    print(f"\nQuick Top-1 Accuracy: {top1_correct}/{len(results)} = {100*top1_correct/len(results):.1f}%")
+    print(f"Quick Top-3 Accuracy: {top3_correct}/{len(results)} = {100*top3_correct/len(results):.1f}%")
 
 
 if __name__ == "__main__":

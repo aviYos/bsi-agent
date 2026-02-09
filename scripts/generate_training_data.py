@@ -15,7 +15,6 @@ Usage:
 """
 
 import argparse
-import random
 import sys
 from pathlib import Path
 
@@ -30,42 +29,87 @@ from bsi_agent.data.redaction import (
     find_pathogen_mentions,
 )
 from bsi_agent.generation import (
+    SummaryGenerator,
     QuestionGenerator,
     AnswerGenerator,
     PathogenClassifier,
-    create_partial_summary,
+    create_partial_case,
     create_dialogue,
 )
 from bsi_agent.evaluation import get_pathogen_rank
 
 
-def step1_create_partial_summaries(input_path: Path, output_path: Path, seed: int = 42):
-    """Step 2.1: Create partial summaries by hiding ~50% of info."""
+def step1_create_partial_summaries(
+    cases_path: Path,
+    full_summaries_path: Path,
+    output_path: Path,
+    api_key: str,
+    model: str,
+    seed: int = 42,
+    max_cases: int = None,
+):
+    """Step 2.1: Create partial summaries from raw case data."""
     print("\n" + "=" * 60)
-    print("STEP 2.1: Create Partial Summaries")
+    print("STEP 2.1: Create Partial Summaries (from raw cases)")
     print("=" * 60)
 
-    summaries = load_jsonl(input_path)
-    print(f"Loaded {len(summaries)} full summaries")
+    # Load raw cases
+    raw_cases = load_jsonl(cases_path)
+    print(f"Loaded {len(raw_cases)} raw BSI cases")
 
-    random.seed(seed)
+    # Load full summaries (needed for downstream steps)
+    full_summaries = load_jsonl(full_summaries_path)
+    full_summary_lookup = {
+        item["case_id"]: item.get("full_summary", "")
+        for item in full_summaries
+    }
+    print(f"Loaded {len(full_summaries)} full summaries")
+
+    # Only process cases that have full summaries
+    raw_cases = [c for c in raw_cases if c["case_id"] in full_summary_lookup]
+    if max_cases:
+        raw_cases = raw_cases[:max_cases]
+    print(f"Processing {len(raw_cases)} cases with matching full summaries")
+
+    # Initialize summary generator (Model A)
+    generator = SummaryGenerator(api_key=api_key, model=model)
+
     results = []
+    for i, raw_case in enumerate(tqdm(raw_cases, desc="Creating partial summaries")):
+        case_id = raw_case["case_id"]
+        ground_truth = raw_case.get("organism", "")
 
-    for i, item in enumerate(summaries):
-        safe_full = sanitize_summary(
-            item.get("full_summary", ""),
-            item.get("ground_truth_pathogen", ""),
+        # Step A: Create partial case (hide categories from raw data)
+        partial_case, hidden_categories = create_partial_case(
+            raw_case, seed=seed + i
         )
-        partial, hidden = create_partial_summary(safe_full, seed=seed + i)
-        leaks = find_pathogen_mentions(partial, item.get("ground_truth_pathogen", ""))
+
+        # Step B: Generate narrative summary from partial case via Model A
+        try:
+            partial_text = generator.generate_summary(partial_case)
+        except Exception as e:
+            print(f"\nError generating summary for {case_id}: {e}")
+            continue
+
+        # Step C: Sanitize (redact pathogen mentions)
+        partial_text = sanitize_summary(partial_text, ground_truth)
+
+        # Step D: Check for leaks
+        leaks = find_pathogen_mentions(partial_text, ground_truth)
         if leaks:
-            print(f"Warning: possible pathogen leakage in {item.get('case_id')}: {leaks}")
+            print(f"Warning: possible pathogen leakage in {case_id}: {leaks}")
+
+        # Retrieve full summary for downstream steps
+        full_summary = full_summary_lookup.get(case_id, "")
+        if full_summary:
+            full_summary = sanitize_summary(full_summary, ground_truth)
+
         results.append({
-            "case_id": item["case_id"],
-            "ground_truth_pathogen": item["ground_truth_pathogen"],
-            "full_summary": safe_full,
-            "partial_summary": partial,
-            "hidden_categories": list(hidden.keys()),
+            "case_id": case_id,
+            "ground_truth_pathogen": ground_truth,
+            "full_summary": full_summary,
+            "partial_summary": partial_text,
+            "hidden_categories": hidden_categories,
         })
 
     save_jsonl(results, output_path)
@@ -323,19 +367,36 @@ def step7_filter_good_questions(
     print(f"  Bad questions: {len(bad_questions)} ({100*len(bad_questions)/total:.1f}%)")
     print(f"\nSaved {len(good_questions)} good [x, q] pairs to {output_path}")
 
+    # Train/test split (80/20)
+    import random as _rng
+    _rng.seed(42)
+    shuffled = list(good_questions)
+    _rng.shuffle(shuffled)
+    split_idx = max(1, int(len(shuffled) * 0.8))
+    train_set = shuffled[:split_idx]
+    test_set = shuffled[split_idx:] if split_idx < len(shuffled) else shuffled[:1]
+
+    train_path = output_path.parent / "good_questions_train.jsonl"
+    test_path = output_path.parent / "good_questions_test.jsonl"
+    save_jsonl(train_set, train_path)
+    save_jsonl(test_set, test_path)
+    print(f"  Train: {len(train_set)} -> {train_path}")
+    print(f"  Test:  {len(test_set)} -> {test_path}")
+
     if good_questions:
         print("\n" + "-" * 60)
         print("EXAMPLE GOOD QUESTION:")
         ex = good_questions[0]
         print(f"  Case: {ex['case_id']}")
         print(f"  Pathogen: {ex['ground_truth_pathogen']}")
-        print(f"  Rank x→d: {ex['rank_x']} → {ex['rank_d']} (improved by {ex['improvement']})")
+        print(f"  Rank x->d: {ex['rank_x']} -> {ex['rank_d']} (improved by {ex['improvement']})")
         print(f"  Question: {ex['q']}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate training data for Model D")
     parser.add_argument("--step", type=int, default=1, help="Start from step (1-7)")
+    parser.add_argument("--max_cases", type=int, default=None, help="Limit number of cases")
     parser.add_argument("--config", type=str, default="configs/config.yaml")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -349,6 +410,7 @@ def main():
     # Define paths
     data_dir = project_root / "data" / "processed"
     paths = {
+        "bsi_cases": data_dir / "bsi_cases.jsonl",
         "full_summaries": data_dir / "full_summaries.jsonl",
         "partial_summaries": data_dir / "partial_summaries.jsonl",
         "questions": data_dir / "questions.jsonl",
@@ -368,9 +430,13 @@ def main():
     # Run steps
     if args.step <= 1:
         step1_create_partial_summaries(
+            paths["bsi_cases"],
             paths["full_summaries"],
             paths["partial_summaries"],
-            args.seed
+            api_key,
+            model,
+            args.seed,
+            args.max_cases,
         )
 
     if args.step <= 2:

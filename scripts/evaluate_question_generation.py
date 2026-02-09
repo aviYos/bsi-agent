@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import PeftModel
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -159,6 +160,17 @@ def main():
         default=64,
         help="Maximum new tokens to generate",
     )
+    parser.add_argument(
+        "--adapter_path",
+        type=str,
+        default=None,
+        help="Path to LoRA adapter (if fine-tuned model)",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="Load model in 4-bit quantization",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
@@ -185,12 +197,27 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     use_device_map = args.device.startswith("cuda")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.float16 if args.device.startswith("cuda") else torch.float32,
-        device_map="auto" if use_device_map else None,
-        trust_remote_code=True,
-    )
+
+    # Model loading kwargs
+    model_kwargs = {
+        "torch_dtype": torch.float16 if args.device.startswith("cuda") else torch.float32,
+        "device_map": "auto" if use_device_map else None,
+        "trust_remote_code": True,
+    }
+    if args.load_in_4bit and use_device_map:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+
+    # Load LoRA adapter if specified
+    if args.adapter_path:
+        print(f"Loading LoRA adapter from: {args.adapter_path}")
+        model = PeftModel.from_pretrained(model, args.adapter_path)
+
     if not use_device_map:
         model.to(args.device)
     model.eval()
