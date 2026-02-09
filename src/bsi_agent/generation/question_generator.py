@@ -14,9 +14,17 @@ Your task is to ask ONE specific question about the most important missing infor
 Focus on asking about:
 - Laboratory values (CBC, metabolic panel, inflammatory markers)
 - Vital signs (temperature, heart rate, blood pressure)
-- Microbiology results (gram stain, culture results)
+- Gram stain morphology (e.g., gram-positive cocci in clusters)
 - Current antibiotics or recent antibiotic exposure
 - Source of infection (urinary, respiratory, line-related, etc.)
+- Antibiotic susceptibility patterns
+
+IMPORTANT - Do NOT ask about any of the following:
+- The specific organism or pathogen that grew in the culture
+- Direct culture results or culture identification
+- "What bacteria was identified?" or similar direct-answer questions
+- The final microbiological diagnosis
+Your question should seek indirect clinical clues, not the answer itself.
 
 Partial Summary:
 {partial_summary}
