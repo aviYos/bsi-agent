@@ -13,75 +13,19 @@ import sys
 from pathlib import Path
 from collections import Counter
 
-
-# Pathogen name mappings for matching
-PATHOGEN_ALIASES = {
-    "ESCHERICHIA COLI": ["E. COLI", "E COLI", "ESCHERICHIA"],
-    "STAPHYLOCOCCUS AUREUS": ["S. AUREUS", "S AUREUS", "STAPH AUREUS", "STAPH AUREUS COAG +"],
-    "KLEBSIELLA PNEUMONIAE": ["K. PNEUMONIAE", "K PNEUMONIAE", "KLEBSIELLA"],
-    "KLEBSIELLA OXYTOCA": ["K. OXYTOCA", "K OXYTOCA"],
-    "PSEUDOMONAS AERUGINOSA": ["P. AERUGINOSA", "P AERUGINOSA", "PSEUDOMONAS"],
-    "ENTEROCOCCUS FAECALIS": ["E. FAECALIS", "E FAECALIS"],
-    "ENTEROCOCCUS FAECIUM": ["E. FAECIUM", "E FAECIUM"],
-    "ENTEROCOCCUS": ["ENTEROCOCCUS SPECIES", "ENTEROCOCCUS SPP"],
-    "STAPHYLOCOCCUS EPIDERMIDIS": ["S. EPIDERMIDIS", "STAPH EPIDERMIDIS", "COAGULASE NEGATIVE STAPHYLOCOCCI", "COAGULASE-NEGATIVE STAPHYLOCOCCI", "CONS"],
-    "STAPHYLOCOCCUS HOMINIS": ["S. HOMINIS", "STAPH HOMINIS"],
-    "STAPHYLOCOCCUS, COAGULASE NEGATIVE": ["COAGULASE NEGATIVE STAPHYLOCOCCI", "COAGULASE-NEGATIVE STAPHYLOCOCCI", "CONS", "STAPHYLOCOCCUS EPIDERMIDIS"],
-    "SERRATIA MARCESCENS": ["S. MARCESCENS", "SERRATIA"],
-    "PROTEUS MIRABILIS": ["P. MIRABILIS", "PROTEUS"],
-    "ENTEROBACTER CLOACAE": ["E. CLOACAE", "ENTEROBACTER"],
-    "CANDIDA ALBICANS": ["C. ALBICANS", "CANDIDA"],
-    "CANDIDA GLABRATA": ["C. GLABRATA"],
-    "STREPTOCOCCUS": ["STREP", "STREPTOCOCCUS SPECIES"],
-    "ACINETOBACTER BAUMANNII": ["A. BAUMANNII", "ACINETOBACTER"],
-}
+# Import shared matching logic
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from bsi_agent.evaluation.pathogen_matching import pathogen_matches
 
 
-def normalize_pathogen(name: str) -> str:
-    """Normalize pathogen name for comparison."""
-    return name.upper().strip()
-
-
-def pathogen_matches(ground_truth: str, prediction: str) -> bool:
-    """Check if prediction matches ground truth, accounting for aliases."""
-    gt = normalize_pathogen(ground_truth)
-    pred = normalize_pathogen(prediction)
-
-    # Exact match
-    if gt == pred:
-        return True
-
-    # Check if prediction contains ground truth or vice versa
-    if gt in pred or pred in gt:
-        return True
-
-    # Check aliases
-    for canonical, aliases in PATHOGEN_ALIASES.items():
-        canonical_upper = canonical.upper()
-        aliases_upper = [a.upper() for a in aliases]
-
-        # If ground truth matches canonical or any alias
-        gt_matches = (gt == canonical_upper or gt in aliases_upper or
-                      any(a in gt for a in [canonical_upper] + aliases_upper))
-
-        # If prediction matches canonical or any alias
-        pred_matches = (pred == canonical_upper or pred in aliases_upper or
-                        any(a in pred for a in [canonical_upper] + aliases_upper))
-
-        if gt_matches and pred_matches:
-            return True
-
-    return False
-
-
-def evaluate_top3(results: list[dict]) -> dict:
-    """Evaluate top-3 accuracy."""
+def evaluate_top_k(results: list[dict], k: int) -> dict:
+    """Evaluate top-k accuracy."""
     correct = 0
     incorrect_cases = []
 
     for r in results:
         gt = r["ground_truth"]
-        preds = r["predictions"]
+        preds = r["predictions"][:k]
 
         is_correct = any(pathogen_matches(gt, p) for p in preds)
 
@@ -137,17 +81,19 @@ def main():
     print("=" * 50)
 
     # Evaluate
-    eval_result = evaluate_top3(results)
+    eval_top1 = evaluate_top_k(results, k=1)
+    eval_top3 = evaluate_top_k(results, k=3)
 
     # Print results
     print(f"\n{'='*50}")
-    print(f"TOP-3 ACCURACY: {eval_result['correct']}/{eval_result['total']} = {100*eval_result['accuracy']:.1f}%")
+    print(f"TOP-1 ACCURACY: {eval_top1['correct']}/{eval_top1['total']} = {100*eval_top1['accuracy']:.1f}%")
+    print(f"TOP-3 ACCURACY: {eval_top3['correct']}/{eval_top3['total']} = {100*eval_top3['accuracy']:.1f}%")
     print(f"{'='*50}")
 
-    if eval_result['accuracy'] >= 0.70:
-        print("\n[PASS] Target accuracy (70%) achieved!")
+    if eval_top3['accuracy'] >= 0.70:
+        print("\n[PASS] Target top-3 accuracy (70%) achieved!")
     else:
-        print(f"\n[FAIL] Below target accuracy (70%). Gap: {70 - 100*eval_result['accuracy']:.1f}%")
+        print(f"\n[FAIL] Below target top-3 accuracy (70%). Gap: {70 - 100*eval_top3['accuracy']:.1f}%")
 
     # Show pathogen-level breakdown
     print("\n" + "-" * 50)
@@ -155,24 +101,30 @@ def main():
 
     # Count by ground truth pathogen
     gt_counts = Counter(r["ground_truth"] for r in results)
-    gt_correct = Counter()
+    gt_correct_top1 = Counter()
+    gt_correct_top3 = Counter()
 
     for r in results:
         gt = r["ground_truth"]
-        if any(pathogen_matches(gt, p) for p in r["predictions"]):
-            gt_correct[gt] += 1
+        preds = r["predictions"]
+        if preds and pathogen_matches(gt, preds[0]):
+            gt_correct_top1[gt] += 1
+        if any(pathogen_matches(gt, p) for p in preds):
+            gt_correct_top3[gt] += 1
 
     for pathogen, total in gt_counts.most_common():
-        correct = gt_correct.get(pathogen, 0)
-        acc = 100 * correct / total if total > 0 else 0
-        status = "OK" if acc >= 70 else "LOW"
-        print(f"  [{status}] {pathogen}: {correct}/{total} ({acc:.0f}%)")
+        c1 = gt_correct_top1.get(pathogen, 0)
+        c3 = gt_correct_top3.get(pathogen, 0)
+        a1 = 100 * c1 / total if total > 0 else 0
+        a3 = 100 * c3 / total if total > 0 else 0
+        status = "OK" if a3 >= 70 else "LOW"
+        print(f"  [{status}] {pathogen}: top1={c1}/{total} ({a1:.0f}%)  top3={c3}/{total} ({a3:.0f}%)")
 
-    # Show some incorrect cases
-    if eval_result['incorrect_cases']:
+    # Show some incorrect cases (top-3 misses)
+    if eval_top3['incorrect_cases']:
         print("\n" + "-" * 50)
-        print(f"Sample incorrect cases ({min(5, len(eval_result['incorrect_cases']))} of {len(eval_result['incorrect_cases'])}):")
-        for case in eval_result['incorrect_cases'][:5]:
+        print(f"Sample incorrect cases - top-3 ({min(5, len(eval_top3['incorrect_cases']))} of {len(eval_top3['incorrect_cases'])}):")
+        for case in eval_top3['incorrect_cases'][:5]:
             print(f"  - GT: {case['ground_truth']}")
             print(f"    Predicted: {case['predictions']}")
             print()
@@ -181,11 +133,14 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump({
-            "top3_accuracy": eval_result["accuracy"],
-            "total_cases": eval_result["total"],
-            "correct": eval_result["correct"],
-            "target_met": eval_result["accuracy"] >= 0.70,
-            "incorrect_cases": eval_result["incorrect_cases"],
+            "top1_accuracy": eval_top1["accuracy"],
+            "top1_correct": eval_top1["correct"],
+            "top3_accuracy": eval_top3["accuracy"],
+            "top3_correct": eval_top3["correct"],
+            "total_cases": eval_top3["total"],
+            "target_met": eval_top3["accuracy"] >= 0.70,
+            "incorrect_cases_top1": eval_top1["incorrect_cases"],
+            "incorrect_cases_top3": eval_top3["incorrect_cases"],
         }, f, indent=2)
 
     print(f"\nReport saved to: {output_path}")
