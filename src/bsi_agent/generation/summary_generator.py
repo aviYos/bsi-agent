@@ -38,9 +38,11 @@ class SummaryGenerator:
         lines.append(f"Age: {case.get('age', 'Unknown')}")
         lines.append(f"Gender: {case.get('gender', 'Unknown')}")
 
-        # Admission
-        lines.append(f"Admission Type: {case.get('admission_type', 'Unknown')}")
-        lines.append(f"Admission Location: {case.get('admission_location', 'Unknown')}")
+        # Admission (skip fields set to None when category is hidden)
+        if case.get('admission_type'):
+            lines.append(f"Admission Type: {case['admission_type']}")
+        if case.get('admission_location'):
+            lines.append(f"Admission Location: {case['admission_location']}")
         if case.get('admit_time'):
             lines.append(f"Admit Time: {case['admit_time']}")
         if case.get('culture_time'):
