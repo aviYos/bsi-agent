@@ -10,18 +10,17 @@ from openai import OpenAI
 
 SUMMARY_PROMPT = """You are a clinical documentation specialist. Given the following structured patient data, write a comprehensive medical summary for a patient with a suspected bloodstream infection.
 
-Include ALL the following information in narrative form:
-- Patient demographics (age, gender)
-- Admission details (type, location, timing)
-- Complete laboratory findings with values and units
-- Vital signs if available
-- Current medications, especially antibiotics
-- Any relevant clinical observations
+IMPORTANT RULES:
+- ONLY describe the information that IS present in the data below.
+- Do NOT mention, note, or comment on any categories of information that are absent, missing, or unavailable. Simply omit them from your summary entirely.
+- Do NOT write phrases like "no medications are specified", "gram stain was not available", "vitals are not reported", etc.
+- Write as if the provided data is the complete clinical picture available at this time.
+- Do NOT mention the actual pathogen/organism if shown - that is for diagnosis.
 
 Patient Data:
 {patient_data}
 
-Write a detailed clinical summary (do NOT mention the actual pathogen/organism if shown - that is for diagnosis):"""
+Write a detailed clinical summary using ONLY the information provided above:"""
 
 
 class SummaryGenerator:

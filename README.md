@@ -58,17 +58,17 @@ Raw case data is randomly partitioned by category. Each category is independentl
 Model A then generates a narrative clinical summary from the partial case data, producing `x` (the partial summary).
 
 **Case 2 example** (67M, true pathogen: Beta Streptococcus Group B):
-> The patient is a 67-year-old male admitted on March 14, 2146... elevated WBC at 16.1 K/uL... creatinine elevated at 5.4 mg/dL... **Current medications and gram stain are not specified in the available data.**
+> The patient is a 67-year-old male admitted on March 14, 2146... elevated WBC at 16.1 K/uL... creatinine elevated at 5.4 mg/dL... laboratory findings suggest a suspected bloodstream infection with accompanying renal impairment...
 
-Note: medications and gram stain were hidden, so the summary mentions their absence.
+Note: medications and gram stain were hidden, but the summary does **not** mention their absence — it simply omits them. This prevents data leakage that would hint which question to ask.
 
 #### Step 2: Model B Asks a Question
 
 Model B sees only the partial summary `x` and asks one diagnostic question `q`:
 
-> **q:** "What was the gram stain morphology observed in the initial blood culture?"
+> **q:** "What was the result of the Gram stain morphology from the blood culture?"
 
-Model B correctly identified that gram stain was the most valuable missing information.
+Model B used clinical reasoning to identify gram stain as the most valuable missing information, without being tipped off by the summary.
 
 #### Step 3: Model A Answers
 
@@ -122,10 +122,10 @@ D receives partial summaries from the test set, generates q\*, and we measure si
 
 | Metric | Score | Notes |
 |--------|-------|-------|
-| Sentence Similarity | 0.28 | Cosine similarity (all-MiniLM-L6-v2) |
-| BLEU | 0.02 | Lexical overlap |
-| ROUGE-L | 0.15 | Longest common subsequence |
-| BERTScore F1 | 0.85 | Semantic similarity (roberta-large) |
+| Sentence Similarity | 0.31 | Cosine similarity (all-MiniLM-L6-v2) |
+| BLEU | 0.01 | Lexical overlap |
+| ROUGE-L | 0.11 | Longest common subsequence |
+| BERTScore F1 | 0.84 | Semantic similarity (roberta-large) |
 
 Low scores are expected with 1 training sample on a 1.1B model. With 1000 cases and Mistral-7B, scores will improve substantially.
 
