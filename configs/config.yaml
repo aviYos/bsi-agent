@@ -36,11 +36,11 @@ training:
 
 # Dialogue generation
 dialogue_generation:
-  model: "gpt-4o"  # or "gpt-4-turbo"
+  model: "gpt-4.1-nano"  # or "gpt-4-turbo"
   num_dialogues: 500
   max_turns: 10
   temperature: 0.7
-  api_key: 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
+  api_key: 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
 
 # Environment configuration
 environment:

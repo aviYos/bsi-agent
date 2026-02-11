@@ -13,10 +13,17 @@ CLASSIFIER_PROMPT = """You are an infectious disease specialist. Based on the fo
 Clinical Summary:
 {summary}
 
-Provide your prediction as a ranked list of the top 3 most likely pathogens:
+Provide your prediction as a ranked list of the top 10 most likely pathogens:
 1. [Pathogen name]
 2. [Pathogen name]
 3. [Pathogen name]
+4. [Pathogen name]
+5. [Pathogen name]
+6. [Pathogen name]
+7. [Pathogen name]
+8. [Pathogen name]
+9. [Pathogen name]
+10. [Pathogen name]
 
 Use standard microbiological nomenclature (e.g., "Staphylococcus aureus", "Escherichia coli", "Klebsiella pneumoniae").
 Only output the numbered list, nothing else."""
@@ -38,7 +45,7 @@ class PathogenClassifier:
             temperature: Model temperature
 
         Returns:
-            List of top 3 predicted pathogens (ranked)
+            List of top 10 predicted pathogens (ranked)
         """
         prompt = CLASSIFIER_PROMPT.format(summary=summary)
 
@@ -46,7 +53,7 @@ class PathogenClassifier:
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
-            max_tokens=200,
+            max_tokens=600,
         )
 
         raw_response = response.choices[0].message.content.strip()
@@ -69,5 +76,4 @@ class PathogenClassifier:
                 pathogen = pathogen.strip('.,;')
                 if pathogen:
                     predictions.append(pathogen)
-
-        return predictions[:3]  # Ensure max 3
+        return predictions[:10]  # Ensure max 10

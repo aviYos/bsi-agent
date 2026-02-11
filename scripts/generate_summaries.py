@@ -19,6 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from bsi_agent.generation.summary_generator import SummaryGenerator
+from bsi_agent.generation.styles_generator import StylesGenerator
 from bsi_agent.data.redaction import sanitize_summary
 
 
@@ -89,6 +90,9 @@ def main():
     print(f"Processing {len(cases)} cases with {model}")
     print("-" * 50)
 
+    styles_gen = StylesGenerator(api_key=api_key, model=model)
+    styles = styles_gen.generate_styles()
+
     # Initialize generator
     generator = SummaryGenerator(api_key=api_key, model=model)
 
@@ -96,7 +100,7 @@ def main():
     summaries = []
     for case in tqdm(cases, desc="Generating summaries"):
         try:
-            summary = generator.generate_summary(case)
+            summary = generator.generate_summary(case, styles_gen.sample_random_style_string())
             summary = sanitize_summary(summary, case.get("organism", ""))
             summaries.append({
                 "case_id": case["case_id"],
