@@ -16,6 +16,7 @@ from typing import Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
+from datasets import Dataset  # Added for consistent splitting
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -27,7 +28,7 @@ from bsi_agent.evaluation.similarity_metrics import (
     compute_rouge_l,
     compute_bertscore_f1,
 )
-from bsi_agent.generation.question_generator import QUESTION_PROMPT
+from bsi_agent.generation.question_generator import QUESTION_PROMPT_TRAINING
 
 
 def extract_reference_question(item: dict) -> str:
@@ -58,7 +59,7 @@ def extract_question(text: str) -> str:
 
 
 def build_prompt(partial_summary: str) -> str:
-    return QUESTION_PROMPT.format(partial_summary=partial_summary)
+    return QUESTION_PROMPT_TRAINING.format(partial_summary=partial_summary)
 
 
 def generate_question(
@@ -171,6 +172,13 @@ def main():
         action="store_true",
         help="Load model in 4-bit quantization",
     )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["all", "train", "test"],
+        help="Which split to evaluate on (uses same seed=42 as training)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
@@ -180,6 +188,28 @@ def main():
     data = load_jsonl(input_path)
     if not data:
         raise ValueError(f"No data found in {input_path}")
+
+    # --- Handle Train/Test Split logic to match train.py ---
+    if args.split != "all":
+        # Convert to HuggingFace Dataset to verify split consistency
+        hf_dataset = Dataset.from_list(data)
+        
+        # Exact logic from train.py
+        # split = dataset.train_test_split(test_size=max(1, int(len(dataset) * 0.1)), seed=42)
+        if len(hf_dataset) > 1:
+            split_obj = hf_dataset.train_test_split(
+                test_size=max(1, int(len(hf_dataset) * 0.1)), 
+                seed=42
+            )
+            
+            if args.split == "test":
+                data = list(split_obj["test"])
+                print(f"Selected TEST split: {len(data)} samples")
+            elif args.split == "train":
+                data = list(split_obj["train"])
+                print(f"Selected TRAIN split: {len(data)} samples")
+        else:
+            print("Warning: Dataset too small to split. Using all data.")
 
     # Subsample if needed
     random.seed(args.seed)

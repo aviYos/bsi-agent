@@ -69,7 +69,7 @@ def format_xq_pair_for_training(
     Labels are masked (-100) for the user prompt tokens so that loss is only
     computed on the assistant response (the question q).
     """
-    from bsi_agent.generation.question_generator import QUESTION_PROMPT
+    from bsi_agent.generation.question_generator import QUESTION_PROMPT_TRAINING
 
     x = item.get("x") or item.get("partial_summary", "")
     q = item.get("q") or item.get("question", "")
@@ -77,7 +77,7 @@ def format_xq_pair_for_training(
     if not x or not q:
         return None
 
-    user_content = QUESTION_PROMPT.format(partial_summary=x)
+    user_content = QUESTION_PROMPT_TRAINING.format(partial_summary=x)
 
     messages = [
         {"role": "user", "content": user_content},
@@ -276,7 +276,7 @@ def main():
     if args.data_path:
         data_path = args.data_path
     elif args.mode == "xq":
-        data_path = f"{data_config.get('processed_dir', 'data/processed')}/good_questions_train.jsonl"
+        data_path = f"{data_config.get('processed_dir', 'data/processed')}/good_questions.jsonl"
     else:
         data_path = f"{data_config.get('dialogues_dir', 'data/synthetic_dialogues')}/dialogues.jsonl"
 

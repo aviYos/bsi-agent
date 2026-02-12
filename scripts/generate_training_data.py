@@ -108,11 +108,10 @@ def step1_create_partial_summaries(raw_cases, generator, styles_gen, seed, max_w
     @retry_with_backoff
     def process(args):
         i, raw_case = args
-
         case_id = raw_case["case_id"]
         gt = raw_case.get("organism", "")
-
-        partial_case, hidden = create_partial_case(raw_case, seed=seed + i)
+        # Use new function that returns hints
+        partial_case, hidden_hints = create_partial_case(raw_case, seed=seed + i)
 
         partial_text = generator.generate_summary(
             partial_case, styles_gen.sample_random_style_string()
@@ -120,16 +119,12 @@ def step1_create_partial_summaries(raw_cases, generator, styles_gen, seed, max_w
 
         partial_text = sanitize_summary(partial_text, gt)
 
-        leaks = find_pathogen_mentions(partial_text, gt)
-        if leaks:
-            print(f"Leak warning {case_id}: {leaks}")
-
         return {
             "case_id": case_id,
             "ground_truth_pathogen": gt,
             "full_summary": "",
             "partial_summary": partial_text,
-            "hidden_categories": hidden,
+            "hidden_hints": hidden_hints, # <--- Save this!
             "raw_case": raw_case,
         }
 
@@ -146,9 +141,21 @@ def step2_generate_questions(data, generator, styles_gen, max_workers):
 
     @retry_with_backoff
     def process(item):
+        
+        # Format hints for the prompt
+        hints = item.get("hidden_hints", [])
+        hints_str = ""
+        if hints:
+            # Shuffle to prevent bias and limit to 15 items
+            rng = random.Random(item["case_id"])
+            rng.shuffle(hints)
+            hints_str = ", ".join(hints[:15])
 
+        # Pass hints to the generator
         q = generator.generate(
-            item["partial_summary"], styles_gen.sample_random_style_string()
+            partial_summary=item["partial_summary"], 
+            style=styles_gen.sample_random_style_string(),
+            available_hints=hints_str  # <--- NEW ARGUMENT
         )
 
         q = redact_pathogen_mentions(q, item["ground_truth_pathogen"])
@@ -156,14 +163,7 @@ def step2_generate_questions(data, generator, styles_gen, max_workers):
         return {
             "case_id": item["case_id"],
             "ground_truth_pathogen": item["ground_truth_pathogen"],
-            "full_summary": sanitize_summary(
-                item.get("full_summary", ""),
-                item["ground_truth_pathogen"],
-            ),
-            "partial_summary": sanitize_summary(
-                item["partial_summary"],
-                item["ground_truth_pathogen"],
-            ),
+            "partial_summary": item["partial_summary"],
             "question": q,
             "raw_case": item.get("raw_case", {}),
         }
@@ -180,15 +180,29 @@ def step3_generate_answers(data, generator, max_workers):
 
     @retry_with_backoff
     def process(item):
-
         raw_case = item.get("raw_case", {})
         gt = item["ground_truth_pathogen"]
-        if raw_case:
-            patient_data = redact_pathogen_mentions(format_case_data(raw_case), gt)
-        else:
-            patient_data = sanitize_summary(item.get("full_summary", ""), gt)
+        
+        patient_data_text = ""
 
-        answer = generator.generate(patient_data, item["question"])
+        # 1. Prepare the FULL Patient Record (Teacher View)
+        if raw_case:
+            # Convert the raw dict to a readable string with ALL labs/vitals
+            full_text = format_case_data(raw_case)
+            
+            # 2. Safety Redaction
+            # We want Model A to know the labs, but NOT the final diagnosis name.
+            # This prevents Model A from slipping up and saying "In cases of E. Coli..."
+            patient_data_text = redact_pathogen_mentions(full_text, gt)
+        else:
+            # Fallback if raw_case is missing (should not happen)
+            patient_data_text = sanitize_summary(item.get("full_summary", ""), gt)
+
+        # 3. Generate Answer
+        # Model A now sees the FULL data (including the 'hidden' hints from Step 2)
+        answer = generator.generate(patient_data_text, item["question"])
+        
+        # 4. Final Safety Redaction on the Answer
         answer = redact_pathogen_mentions(answer, gt)
 
         return {
@@ -200,7 +214,6 @@ def step3_generate_answers(data, generator, max_workers):
         }
 
     return parallel_map(data, process, max_workers, "Step3")
-
 
 # =====================================================
 # Step 4

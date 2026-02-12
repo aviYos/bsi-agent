@@ -47,10 +47,7 @@ class AnswerGenerator:
             patient_data=patient_data,
             question=question
         )
-        print("-------------------------------------------")
-        print("ANSWER GENERATION PROMPT:")
-        print(prompt)
-        print("-------------------------------------------")
+
 
         response = self.client.chat.completions.create(
             model=self.model,

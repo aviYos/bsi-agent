@@ -26,6 +26,7 @@ wheels/
 *.egg
 
 # MIMIC-IV data (sensitive - never commit)
+data/
 data/raw/
 full_data/
 data/cache/

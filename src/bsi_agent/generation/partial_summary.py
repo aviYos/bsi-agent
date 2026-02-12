@@ -80,73 +80,61 @@ ATOMIC_FIELDS = {
 # LOGIC
 # ==============================================================================
 
-def create_partial_case(
-    raw_case: dict,
-    seed: int = None,
-    keep_probs: dict = None,
-) -> tuple[dict, list[str]]:
-    """
-    Create a partial case by randomly filtering ITEMS inside categories.
-    
-    Instead of removing 'labs' entirely, we remove ~60% of the specific lab rows.
-    This creates a 'Swiss Cheese' effect where specific data points are missing.
-    """
-    if keep_probs is None:
-        keep_probs = ITEM_KEEP_PROBABILITY
-
+def create_partial_case(raw_case: dict, seed: int = None) -> tuple[dict, list[str]]:
     rng = random.Random(seed)
-    
-    # Deep copy to ensure we don't modify the raw_case by accident
     partial = copy.deepcopy(raw_case)
-    
-    # Track what we touched (for logging/debugging purposes)
-    hidden_meta = []
+    hidden_hints = [] 
 
-    # --- 1. Handle Atomic Fields (Single Values) ---
+    # 1. Atomic Fields
     for field, category in ATOMIC_FIELDS.items():
-        prob = keep_probs.get(category, 0.5)
-        
-        # Logic: If random > prob, we hide it.
-        # BUT: For 0.0 (like gram_stain), we force hide. 
-        # For 1.0 (demographics), we force keep.
-        if prob < 1.0 and rng.random() > prob:
-            partial[field] = None # or "Unknown" depending on your preference
-            hidden_meta.append(field)
-
-    # --- 2. Handle List Fields (Labs, Vitals, Meds) ---
-    for field in LIST_FIELDS:
-        category = field # keys match categories in this simple setup
-        prob = keep_probs.get(category, 0.5)
-        
-        original_list = partial.get(field, [])
-        if not original_list:
+        # CRITICAL FIX: Skip "organism" for hints. We hide it, but don't hint it.
+        if field == "organism":
+            # Force remove organism logic is handled in step 4 below
             continue
+
+        prob = ITEM_KEEP_PROBABILITY.get(category, 0.5)
+        if partial.get(field) is not None:
+            if prob < 1.0 and rng.random() > prob:
+                partial[field] = None
+                # Add human-readable hint
+                hidden_hints.append(field.replace("_", " ").title())
+
+    # 2. List Fields (Labs, Vitals, Meds)
+    for field in LIST_FIELDS:
+        prob = ITEM_KEEP_PROBABILITY.get(field, 0.5)
+        original_list = partial.get(field, [])
+        if not original_list: continue
             
-        # Filter the list
-        # We keep an item if random() < prob
-        new_list = [item for item in original_list if rng.random() < prob]
-        
+        new_list = []
+        for item in original_list:
+            name = item.get('lab_name') or item.get('vital_name') or item.get('drug') or "Unknown Item"
+            if rng.random() < prob:
+                new_list.append(item)
+            else:
+                hidden_hints.append(str(name))
         partial[field] = new_list
-        
-        # Log if we removed things
-        if len(new_list) < len(original_list):
-            hidden_meta.append(f"partial_{field}")
 
-    # --- 3. Handle Susceptibilities (CRITICAL LEAK PREVENTION) ---
-    # format_case_data prints 'susceptibilities' if they exist.
-    # We MUST remove them from the partial case dict, otherwise Model A
-    # (acting as the summarizer) might see them, or they might leak into 
-    # the partial text if you use a direct dump.
-    if keep_probs.get("susceptibilities", 0.0) == 0.0:
+    # 3. Susceptibilities
+    if raw_case.get('susceptibilities'):
         partial["susceptibilities"] = {}
-        hidden_meta.append("susceptibilities")
+        # Hint is allowed here if you want them to ask about resistance patterns, 
+        # BUT usually better to hide to force clinical reasoning. 
+        # Uncomment next line if you want to allow asking for resistance:
+        hidden_hints.append("Antibiotic Susceptibility Profile")
+    
+    if raw_case.get('gram_stain'):
+        partial["gram_stain"] = None
+        # Hint is allowed here if you want them to ask about gram stain results, 
+        # BUT usually better to hide to force clinical reasoning. 
+        # Uncomment next line if you want to allow asking for gram stain:
+        hidden_hints.append("Gram Stain Result")
 
-    # --- 4. Handle Organism (The Truth) ---
-    if keep_probs.get("organism", 0.0) == 0.0:
-        partial["organism"] = None
-    print(f"Created partial case with hidden fields: {hidden_meta}")
-    print(partial)
-    return partial, hidden_meta
+    # 4. Organism (ALWAYS HIDE, NEVER HINT)
+    # This ensures Model A doesn't see it in the partial text,
+    # and Model B doesn't see it in the hints.
+    partial["organism"] = None
+
+    return partial, hidden_hints
 
 
 def create_dialogue(partial_summary: str, question: str, answer: str) -> str:

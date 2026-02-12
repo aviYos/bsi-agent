@@ -58,8 +58,8 @@ def format_case_data(case: dict) -> str:
         lines.append(f"Specimen Type: {case['specimen_type']}")
     
     # Gram Stain
-    # if case.get('gram_stain'):
-        # lines.append(f"Gram Stain: {case['gram_stain']}")
+    if case.get('gram_stain'):
+        lines.append(f"Gram Stain: {case['gram_stain']}")
 
     # Susceptibilities (Crucial for treatment questions)
     susceptibilities = case.get('susceptibilities', {})
@@ -180,9 +180,8 @@ class SummaryGenerator:
         patient_data = self._format_case_data(case)
         prompt = SUMMARY_PROMPT.format(patient_data=patient_data, style=style)
 
-        print("SUMMARY GENERATION PROMPT:")
-        print(prompt)
-        
+
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
