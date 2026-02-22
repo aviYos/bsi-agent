@@ -1,133 +1,147 @@
-# BSI-Agent: Training a Language Model to Ask Diagnostic Questions
+# BSI-Agent: Teaching a Small LLM to Ask the Right Diagnostic Question
 
-Train a small language model (Model D) that, given a partial clinical summary of a bloodstream infection (BSI) patient, asks the single most informative diagnostic question.
+> **The problem:** A patient has a bloodstream infection. The clinician has incomplete lab results. What single question should they ask to best identify the pathogen?
 
-## Architecture
+This project trains a small language model (Model D) to generate that question. Given a partial clinical summary with missing data, Model D learns to ask the one question that most improves pathogen identification -- distilling the diagnostic reasoning of GPT-4o into a model that can run locally.
 
-Four models work together:
-
-| Model | Role | Implementation |
-|-------|------|----------------|
-| **A** | Summarizer / Answerer | GPT-4o |
-| **B** | Question Generator | GPT-4o |
-| **C** | Pathogen Classifier | GPT-4o |
-| **D** | Fine-tuned Question Generator | Mistral-7B (QLoRA) |
-
-## Pipeline Overview
-
-```
-Phase 0: Validate C          Phase 1: Generate Training Data          Phase 2: Train D       Phase 3: Evaluate D
----------------------    ------------------------------------    ------------------    -------------------
-Full Summary (100%)      Raw Case + Full Summary                 good [x, q] pairs    D generates q*
-        |                        |                                      |              compare q* to q
-   Model C classifies      1. Hide ~50% categories                  QLoRA fine-tune    sentence similarity
-        |                  2. Model A narrates partial -> x              |
-   Top-3 accuracy?         3. Model B asks question -> q           Model D trained
-   (target: 70%)           4. Model A answers from full -> a
-                           5. d = x + q + a
-                           6. Model C classifies x -> rank_x
-                           7. Model C classifies d -> rank_d
-                           8. Keep [x,q] where rank_d < rank_x
-```
+**Built on:** MIMIC-IV (10,000+ real ICU cases) | **Course:** Bar-Ilan University, LLM Course
 
 ---
 
-## End-to-End Example (2 Cases)
-
-### Phase 0 - Validate Model C
-
-Model C receives full clinical summaries (100% patient information) and predicts the top-3 most likely pathogens.
-
-**Result on 100 cases:** Top-1 = 38.4%, **Top-3 = 77.8%** (target: >70%)
-
-### Phase 1 - Dataset Generation
-
-#### Step 1: Create Partial Summaries
-
-Raw case data is randomly partitioned by category. Each category is independently kept or hidden:
-
-| Category | Keep Probability | Hidden in Example? |
-|----------|------------------|--------------------|
-| Demographics | 100% | No |
-| Admission | 80% | No |
-| Labs | 40% | No |
-| Vitals | 50% | No |
-| Medications | 40% | **Yes** |
-| Gram Stain | 20% | **Yes** |
-
-Model A then generates a narrative clinical summary from the partial case data, producing `x` (the partial summary).
-
-**Case 2 example** (67M, true pathogen: Beta Streptococcus Group B):
-> The patient is a 67-year-old male admitted on March 14, 2146... elevated WBC at 16.1 K/uL... creatinine elevated at 5.4 mg/dL... laboratory findings suggest a suspected bloodstream infection with accompanying renal impairment...
-
-Note: medications and gram stain were hidden, but the summary does **not** mention their absence — it simply omits them. This prevents data leakage that would hint which question to ask.
-
-#### Step 2: Model B Asks a Question
-
-Model B sees only the partial summary `x` and asks one diagnostic question `q`:
-
-> **q:** "What was the result of the Gram stain morphology from the blood culture?"
-
-Model B used clinical reasoning to identify gram stain as the most valuable missing information, without being tipped off by the summary.
-
-#### Step 3: Model A Answers
-
-Model A sees the **full** patient data (including hidden categories) and answers:
-
-> **a:** "The gram stain morphology observed in the initial blood culture showed gram-positive cocci in chains."
-
-#### Step 4: Create Dialogue
-
-The dialogue `d` is assembled as: `d = x + q + a`
-
-#### Step 5-6: Model C Classifies
-
-Model C predicts the pathogen from the partial summary alone, and from the full dialogue:
-
-| Input | Predictions | Rank |
-|-------|-------------|------|
-| **x** (partial only) | [E. coli, S. aureus, K. pneumoniae] | **99** (not found) |
-| **d** (with Q&A) | [S. pyogenes, **S. agalactiae**, E. faecalis] | **2** (correct at position 2) |
-
-Without the question, Model C had no idea it was Group B Strep. After learning the gram stain showed "gram-positive cocci in chains", it correctly narrowed to Streptococcus species.
-
-#### Step 7: Filter Good Questions
-
-A question is "good" if it improved the pathogen ranking: `rank_d < rank_x`
-
-| Case | Pathogen | rank_x | rank_d | Good? | Improvement |
-|------|----------|--------|--------|-------|-------------|
-| 1 (79F) | E. coli | 1 | 1 | No | 0 (already correct) |
-| **2 (67M)** | **Group B Strep** | **99** | **2** | **Yes** | **97** |
-
-**Result: 1 good [x, q] pair** -- the question about gram stain morphology dramatically improved classification.
-
-### Phase 2 - Train Model D
-
-Fine-tune a small model on good [x, q] pairs using QLoRA:
-- Input: partial summary (x)
-- Target: the good question (q)
-- Loss: only on assistant response (user prompt tokens masked with -100)
+## The Core Idea
 
 ```
-Training config:
-  Base model: TinyLlama-1.1B (debug) / Mistral-7B (production)
-  LoRA: r=16, alpha=32, targets=[q_proj, k_proj, v_proj, o_proj]
-  Loss: causal LM, supervised only on q (label masking on prompt)
+ Partial patient summary               "What was the Gram stain
+ (labs, vitals -- but some     --->     morphology from the blood
+  data is missing)              D        culture?"
 ```
 
-### Phase 3 - Evaluate Model D
+Model D doesn't guess the pathogen. It asks the question that *helps a classifier guess better*.
 
-D receives partial summaries from the test set, generates q\*, and we measure similarity to the reference q:
+---
 
-| Metric | Score | Notes |
-|--------|-------|-------|
-| Sentence Similarity | 0.31 | Cosine similarity (all-MiniLM-L6-v2) |
-| BLEU | 0.01 | Lexical overlap |
-| ROUGE-L | 0.11 | Longest common subsequence |
-| BERTScore F1 | 0.84 | Semantic similarity (roberta-large) |
+## How It Works: 4 Models, 1 Pipeline
 
-Low scores are expected with 1 training sample on a 1.1B model. With 1000 cases and Mistral-7B, scores will improve substantially.
+```
+                                    TRAINING PIPELINE
+                    ================================================
+
+  Raw Case (100% data)
+        |
+        v
+  [1] Hide ~50% of data ---------> Partial Summary (x)
+        |                                  |
+        |                                  v
+        |                          [2] Model B asks: "What is the Gram stain?" ---> q
+        |                                  |
+        v                                  v
+  [3] Model A answers from full data ----> a = "Gram-positive cocci in chains"
+                                           |
+                                           v
+                                    [4] Dialogue: d = x + q + a
+                                           |
+                              +------------+------------+
+                              |                         |
+                              v                         v
+                    [5] Model C classifies      [6] Model C classifies
+                        from x alone                from d (with Q&A)
+                        rank_x = 99                 rank_d = 2
+                              |                         |
+                              +------------+------------+
+                                           |
+                                           v
+                                    [7] rank_d < rank_x?
+                                        YES --> good [x, q] pair
+                                           |
+                                           v
+                                    [8] Train Model D on
+                                        good [x, q] pairs (QLoRA)
+```
+
+| Model | Role | Implementation |
+|-------|------|----------------|
+| **A** | Summarizer + Answerer | GPT-4o -- narrates partial data, answers questions from full data |
+| **B** | Question Asker | GPT-4o -- given partial summary + hints of what's hidden, asks one question |
+| **C** | Pathogen Classifier | GPT-4o -- predicts top pathogens from clinical text |
+| **D** | Learned Question Asker | Mistral-7B with QLoRA -- the model we're training |
+
+---
+
+## Example: One Case Through the Pipeline
+
+**Patient:** 67-year-old male, admitted to ICU. True pathogen: **Beta Streptococcus Group B**.
+
+**Step 1 -- Partial Summary (x):** Labs show elevated WBC (16.1), creatinine (5.4). Medications and gram stain are **hidden**.
+
+**Step 2 -- Model B asks (q):**
+> *"What was the result of the Gram stain morphology from the blood culture?"*
+
+**Step 3 -- Model A answers (a):**
+> *"Gram-positive cocci in chains."*
+
+**Step 5-6 -- Classification impact:**
+
+| Input | Model C's Top Predictions | Rank of True Pathogen |
+|-------|--------------------------|----------------------|
+| Partial only (x) | E. coli, K. pneumoniae, S. aureus | **99** (not found) |
+| With Q&A (d) | S. pyogenes, **S. agalactiae**, E. faecalis | **2** |
+
+One question moved the pathogen from "not even in the top 10" to position 2. This is a **good question** -- it becomes a training example for Model D.
+
+---
+
+## Key Design Decisions
+
+### Data Hiding (Partial Summaries)
+Each clinical item is independently kept or hidden at the **item level** (not category level):
+
+| Category | Keep % | Rationale |
+|----------|--------|-----------|
+| Demographics | 100% | Age/gender are always available |
+| Admission | 100% | ICU vs ward context is fundamental |
+| Labs | 40% | Force the model to ask for missing labs |
+| Vitals | 50% | Partially available in practice |
+| Medications | 50% | Treatment context is sometimes known |
+| Gram Stain | 0% | Key diagnostic info -- always hide |
+| Organism | 0% | The answer -- never reveal |
+| Susceptibilities | 0% | Would leak the pathogen identity |
+
+Hidden items generate **hints** passed to Model B, ensuring it only asks about data that exists in the full record.
+
+### Style Variation
+Each summary and question is generated with a **randomized writing style** (tone, structure, specificity). This prevents Model D from memorizing surface patterns and improves generalization.
+
+### Label Masking
+During training, loss is computed **only on the question tokens** (the assistant response). The partial summary tokens in the prompt are masked with -100 so the model learns *what to ask*, not *how to repeat the input*.
+
+---
+
+## Results
+
+### Phase 0: Model C Baseline (100 cases, full summaries)
+
+| Metric | Score |
+|--------|-------|
+| Top-1 Accuracy | 38.4% |
+| **Top-3 Accuracy** | **77.8%** |
+| Target | 70% |
+
+Model C can identify the pathogen in the top 3 for ~78% of cases when given the full summary. This validates it as a useful classifier for the pipeline.
+
+### Phase 1: Question Quality
+
+Questions are filtered by whether they improve classification. The **good question rate** and **average rank improvement** are the key metrics for the dataset quality.
+
+### Phase 3: Model D Evaluation
+
+Model D is evaluated on held-out test cases using 4 metrics:
+
+| Metric | What It Measures |
+|--------|-----------------|
+| Sentence Similarity | Semantic closeness (all-MiniLM-L6-v2) |
+| BLEU | Lexical n-gram overlap |
+| ROUGE-L | Longest common subsequence |
+| BERTScore F1 | Contextual semantic similarity (roberta-large) |
 
 ---
 
@@ -137,7 +151,7 @@ Low scores are expected with 1 training sample on a 1.1B model. With 1000 cases 
 
 1. **MIMIC-IV data** in `full_data/mimic-iv-3.1/`
 2. **OpenAI API key** in `configs/config.yaml`
-3. **Dependencies:** `pip install -r requirements.txt`
+3. `pip install -r requirements.txt`
 
 ### Phase 0: Validate Model C
 
@@ -151,59 +165,44 @@ python scripts/evaluate_classifier.py
 ### Phase 1: Generate Training Data
 
 ```bash
-python scripts/generate_training_data.py --max_cases 1000
+python scripts/generate_training_data.py --max_cases 1000           # full run
+python scripts/generate_training_data.py --step 3 --max_cases 1000  # resume from step 3
+python scripts/generate_training_data.py --max_cases 2              # debug
+python scripts/generate_training_data.py --max_cases 1000 --workers 10  # more threads
 ```
 
-Runs all 7 steps. Use `--step N` to resume from step N. Use `--max_cases 2` for debug.
+All 7 steps run in sequence. Each step checkpoints to disk, so you can resume with `--step N`. Execution logs go to `logs/`.
 
 ### Phase 2: Train Model D
 
 ```bash
 # Debug (CPU, small model)
-python scripts/train.py --mode xq --base_model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --num_epochs 3 --batch_size 1 --no_quantize --output_dir outputs/model_debug
+python scripts/train.py --mode xq \
+    --base_model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --num_epochs 3 --batch_size 1 --no_quantize \
+    --output_dir outputs/model_debug
 
-# Production (GPU, 4-bit quantization)
-python scripts/train.py --mode xq --base_model mistralai/Mistral-7B-Instruct-v0.3
+# Production (GPU, Mistral-7B with 4-bit QLoRA)
+python scripts/train.py --mode xq \
+    --base_model mistralai/Mistral-7B-Instruct-v0.3
 ```
 
 ### Phase 3: Evaluate Model D
 
 ```bash
-# Debug
-python scripts/evaluate_question_generation.py \
-    --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --adapter_path outputs/model_debug/final \
-    --input_path data/processed/good_questions_test.jsonl
-
-# Production
 python scripts/evaluate_question_generation.py \
     --model mistralai/Mistral-7B-Instruct-v0.3 \
     --adapter_path outputs/model/final \
-    --load_in_4bit
+    --load_in_4bit --split test
 ```
 
----
+### Plots for Presentation
 
-## Output Files
+```bash
+python scripts/create_plots.py
+```
 
-| File | Description |
-|------|-------------|
-| `data/processed/bsi_cases.jsonl` | Raw BSI cases from MIMIC-IV |
-| `data/processed/full_summaries.jsonl` | Full clinical summaries (Model A) |
-| `data/processed/classification_results.jsonl` | Phase 0: Model C predictions on full summaries |
-| `data/processed/validation_report.json` | Phase 0: accuracy report |
-| `data/processed/partial_summaries.jsonl` | Partial summaries with hidden categories |
-| `data/processed/questions.jsonl` | Questions from Model B |
-| `data/processed/answers.jsonl` | Answers from Model A |
-| `data/processed/dialogues.jsonl` | Assembled dialogues (d = x + q + a) |
-| `data/processed/classifications_x.jsonl` | Model C predictions from partial summary (x) |
-| `data/processed/classifications_d.jsonl` | Model C predictions from dialogue (d) |
-| `data/processed/good_questions.jsonl` | Filtered good [x, q] pairs |
-| `data/processed/good_questions_train.jsonl` | Training split (80%) |
-| `data/processed/good_questions_test.jsonl` | Test split (20%) |
-| `data/processed/question_eval.json` | Evaluation metrics |
-| `outputs/model/final/` | Trained LoRA adapter |
+Generates 7 figures to `outputs/plots/`: pathogen distribution, Top-K accuracy, per-pathogen breakdown, rank improvement (x vs d), question filtering, quality radar chart, and training loss curve.
 
 ---
 
@@ -211,61 +210,68 @@ python scripts/evaluate_question_generation.py \
 
 ```
 bsi-agent/
-├── configs/
-│   └── config.yaml                          # API keys & model settings
+├── configs/config.yaml                 # API keys, model & training config
+│
 ├── scripts/
-│   ├── extract_bsi_cases.py                 # Extract BSI cases from MIMIC-IV
-│   ├── generate_summaries.py                # Generate full summaries (Model A)
-│   ├── test_classifier.py                   # Test Model C on full summaries
-│   ├── evaluate_classifier.py               # Evaluate Phase 0 accuracy
-│   ├── generate_training_data.py            # Phase 1: 7-step data generation
-│   ├── train.py                             # Phase 2: QLoRA fine-tuning
-│   └── evaluate_question_generation.py      # Phase 3: evaluate Model D
+│   ├── extract_bsi_cases.py            # Extract BSI cases from MIMIC-IV
+│   ├── generate_summaries.py           # Generate full summaries (Model A)
+│   ├── test_classifier.py              # Test Model C on full summaries
+│   ├── evaluate_classifier.py          # Evaluate Phase 0 accuracy
+│   ├── generate_training_data.py       # 7-step parallel data generation pipeline
+│   ├── train.py                        # QLoRA fine-tuning (xq mode)
+│   ├── evaluate_question_generation.py # Evaluate Model D (4 metrics)
+│   ├── create_plots.py                 # Generate presentation plots
+│   └── demo_one_case.py               # Demo: one case end-to-end
+│
 ├── src/bsi_agent/
-│   ├── data/
-│   │   ├── mimic_loader.py                  # MIMIC-IV data loading
-│   │   ├── bsi_cohort.py                    # BSI case extraction
-│   │   ├── utils.py                         # load_jsonl, save_jsonl
-│   │   └── redaction.py                     # Sanitize pathogen mentions
-│   ├── generation/
-│   │   ├── summary_generator.py             # Model A: summarize
-│   │   ├── question_generator.py            # Model B: ask questions
-│   │   ├── answer_generator.py              # Model A: answer questions
-│   │   ├── pathogen_classifier.py           # Model C: classify pathogens
-│   │   └── partial_summary.py               # Category-level data hiding
-│   └── evaluation/
-│       ├── pathogen_matching.py             # Pathogen name alias matching
-│       └── similarity_metrics.py            # Sentence similarity, BLEU, ROUGE, BERTScore
-└── data/processed/                          # All pipeline outputs
+│   ├── data/                           # MIMIC-IV loading, case extraction, redaction
+│   ├── generation/                     # Models A, B, C + partial summary + style variation
+│   └── evaluation/                     # Pathogen matching + similarity metrics
+│
+├── data/processed/                     # All pipeline outputs (JSONL)
+├── outputs/                            # Trained adapters + plots
+└── logs/                               # Execution logs
 ```
 
+<details>
+<summary>Output files reference</summary>
+
+| File | Description |
+|------|-------------|
+| `data/processed/bsi_cases.jsonl` | Raw BSI cases from MIMIC-IV |
+| `data/processed/full_summaries.jsonl` | Full clinical summaries |
+| `data/processed/classification_results.jsonl` | Phase 0 predictions |
+| `data/processed/partial_summaries.jsonl` | Partial summaries + hints |
+| `data/processed/questions.jsonl` | Model B questions |
+| `data/processed/answers.jsonl` | Model A answers |
+| `data/processed/dialogues.jsonl` | Assembled dialogues (d = x + q + a) |
+| `data/processed/classifications_x.jsonl` | Classify from partial (x) |
+| `data/processed/classifications_d.jsonl` | Classify from dialogue (d) |
+| `data/processed/good_questions.jsonl` | Filtered good [x, q] pairs |
+| `data/processed/question_eval.json` | Model D evaluation results |
+| `outputs/model/final/` | Trained LoRA adapter |
+| `outputs/plots/` | Presentation figures |
+
+</details>
+
 ---
 
-## Cost Estimate (1000 cases)
+## Cost & Hardware
 
-| Step | API Calls | Est. Cost |
-|------|-----------|-----------|
-| Extract + Full Summaries | 1000 | ~$10 |
-| Partial Summaries (Model A) | 1000 | ~$10 |
-| Questions (Model B) | 1000 | ~$5 |
-| Answers (Model A) | 1000 | ~$5 |
-| Classify from x (Model C) | 1000 | ~$5 |
-| Classify from d (Model C) | 1000 | ~$5 |
-| **Total** | **6000** | **~$40** |
+| | Detail |
+|-|--------|
+| **API cost** (1000 cases) | ~$40 (6 GPT-4o calls per case) |
+| **Training (production)** | NVIDIA GPU, 16GB+ VRAM (QLoRA 4-bit) |
+| **Training (debug)** | CPU only (`--no_quantize` with TinyLlama-1.1B) |
+| **Inference** | 8GB+ VRAM with 4-bit quantization |
 
 ---
-
-## Hardware Requirements
-
-- **Training (production):** NVIDIA GPU with 16GB+ VRAM (QLoRA with 4-bit quantization)
-- **Training (debug):** CPU only (use `--no_quantize` with TinyLlama-1.1B)
-- **Inference:** 8GB+ VRAM with 4-bit quantization
 
 ## License
 
-This project is for research purposes only. MIMIC-IV data usage is subject to the PhysioNet Credentialed Health Data License.
+Research purposes only. MIMIC-IV data usage is subject to the PhysioNet Credentialed Health Data License.
 
 ## Acknowledgments
 
-- MIMIC-IV dataset by PhysioNet
-- Bar-Ilan University LLM Course Project
+- MIMIC-IV dataset (PhysioNet)
+- Bar-Ilan University LLM Course
